@@ -7,7 +7,7 @@
 //! | Flavour | Feature | Symbols resolved |
 //! |---|---|---|
 //! | [`RkllmRuntime`] | `libloading` (default) | by `dlopen`, at run time |
-//! | [`Linked`] | `link` | by the linker, at build time |
+//! | [`RkllmStatic`] | `link` | by the linker, at build time |
 //!
 //! Both implement [`RkllmApi`], so a caller can be generic over which one it
 //! got. Everything here is `unsafe` and maps one-to-one onto the C API. The
@@ -55,8 +55,8 @@ mod tests {
 
         #[cfg(feature = "link")]
         {
-            assert_impl::<Linked>();
-            let _: &dyn RkllmApi = &Linked::new();
+            assert_impl::<RkllmStatic>();
+            let _: &dyn RkllmApi = &RkllmStatic::new();
         }
 
         #[cfg(feature = "libloading")]

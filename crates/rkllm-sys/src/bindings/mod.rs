@@ -188,13 +188,14 @@ pub unsafe trait RkllmApi {
 
 /// The link-time API: a zero-sized handle onto the symbols the linker resolved.
 ///
-/// Available with the default `link` feature.
+/// Available with the `link` feature. Its counterpart is [`RkllmRuntime`],
+/// which resolves the same symbols with `dlopen` instead.
 #[cfg(feature = "link")]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Linked;
+pub struct RkllmStatic;
 
 #[cfg(feature = "link")]
-impl Linked {
+impl RkllmStatic {
     /// Returns the link-time API handle.
     pub const fn new() -> Self {
         Self
@@ -203,7 +204,7 @@ impl Linked {
 
 #[cfg(feature = "link")]
 #[allow(non_snake_case)]
-unsafe impl RkllmApi for Linked {
+unsafe impl RkllmApi for RkllmStatic {
     unsafe fn rkllm_createDefaultParam(&self) -> RKLLMParam {
         unsafe { link::rkllm_createDefaultParam() }
     }

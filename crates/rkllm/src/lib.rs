@@ -14,11 +14,11 @@
 //!
 //! ```no_run
 //! use rkllm::{Control, InferParams, Input, Param, RkllmSession};
-//! use rkllm_sys::RkllmApi;
 //!
-//! # fn chat<A: RkllmApi>(api: A) -> rkllm::Result<()> {
-//! let param = Param::new(&api, "/data/qwen.rkllm")?.max_new_tokens(256);
-//! let session = RkllmSession::new(api, &param)?;
+//! # #[cfg(feature = "libloading")]
+//! # fn chat() -> rkllm::Result<()> {
+//! let param = Param::new("/data/qwen.rkllm")?.max_new_tokens(256);
+//! let session = RkllmSession::new_with_library(rkllm_sys::LIBRARY_NAME, &param)?;
 //!
 //! let mut input = Input::prompt("Why is the sky blue?")?;
 //! session.run_llm(&mut input, &InferParams::new(), |out| {
@@ -29,20 +29,20 @@
 //! # }
 //! ```
 //!
-//! With the default `libloading` feature, `api` above is an `RkllmRuntime` you
-//! opened with `dlopen`. With `link` it is `rkllm_sys::Linked`, a zero-sized
-//! value over symbols the linker resolved.
-//!
 //! # Which bindings
 //!
-//! [`RkllmSession`] is generic over the `rkllm-sys` binding flavour. With the
-//! default `libloading` feature that is an `RkllmRuntime`, opened at run time,
-//! so a build needs no `librkllmrt` present at all. `Arc<RkllmRuntime>` works
-//! too, letting several sessions share one loaded library.
+//! [`RkllmSession`] is generic over the `rkllm-sys` binding flavour, but you
+//! never have to name one. Each flavour brings its own constructor, and which
+//! ones exist depends on the features:
 //!
-//! With the `link` feature instead it is `Linked`, a zero-sized type over
-//! symbols the linker resolved, which means the library must be available at
-//! build time.
+//! * `RkllmSession::new_with_library(path, &param)` opens the shared library
+//!   with `dlopen`. Needs the default `libloading` feature.
+//! * `RkllmSession::new(&param)` uses the symbols the linker resolved, so the
+//!   library has to be present at build time. Needs the `link` feature.
+//!
+//! A [`Param`] is a plain value either way. Building one needs no runtime, and
+//! the settings you leave alone keep whatever defaults that build of
+//! `librkllmrt` ships.
 //!
 //! # Not wrapped yet
 //!
@@ -61,6 +61,9 @@ pub mod session;
 
 #[cfg(feature = "tokio")]
 pub mod stream;
+
+#[cfg(test)]
+mod fake_runtime;
 
 pub use crate::error::{Error, Result};
 pub use crate::infer::{InferParams, Mode, Sampling};

@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use clap::Parser;
 use rkllm::{CallState, Control, InferParams, Input, Param, PerfStat, RkllmSession};
-use rkllm_sys::{LIBRARY_NAME, RkllmRuntime};
+use rkllm_sys::LIBRARY_NAME;
 
 const DEFAULT_PROMPT: &str = "Explain who Napoleon Bonaparte is in two or three sentences.";
 
@@ -79,21 +79,16 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         args.prompt.join(" ")
     };
 
-    eprintln!("loading {}", args.library);
-    // SAFETY: loading a shared object runs its initializers. This one is the
-    // RKLLM runtime, whose symbols the bindings were generated from.
-    let runtime = unsafe { RkllmRuntime::new(&args.library) }?;
-
-    let param = Param::new(&runtime, args.model.as_str())?
+    let param = Param::new(args.model.as_str())?
         .max_context_len(args.max_context_len)
         .max_new_tokens(args.max_new_tokens)
         .temperature(args.temperature)
         .top_k(args.top_k)
         .top_p(args.top_p);
 
-    eprintln!("loading {}", args.model);
+    eprintln!("loading {} via {}", args.model, args.library);
     let started = Instant::now();
-    let session = RkllmSession::new(runtime, &param)?;
+    let session = RkllmSession::new_with_library(&args.library, &param)?;
     eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
 
     if args.chatml {
