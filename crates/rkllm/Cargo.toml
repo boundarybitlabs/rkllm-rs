@@ -24,5 +24,13 @@ futures-core = { version = "0.3", optional = true }
 futures-util = { version = "0.3", default-features = false }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros"] }
 
+[[example]]
+name = "chat"
+required-features = ["link"]
+
+[[example]]
+name = "stream"
+required-features = ["link", "tokio"]
+
 [package.metadata.docs.rs]
 all-features = true
