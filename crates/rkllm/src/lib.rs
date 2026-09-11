@@ -46,9 +46,13 @@
 //!
 //! # Not wrapped yet
 //!
-//! Multimodal input, cross-attention parameters, and the tokenizer and
-//! embedding callbacks are reachable through `rkllm-sys` but have no safe
-//! wrapper here.
+//! Video input, cross-attention parameters, and the tokenizer and embedding
+//! callbacks are reachable through `rkllm-sys` but have no safe wrapper here.
+//! Image input is wrapped, see [`ImageInput`].
+//!
+//! Multi-batch inference is not offered either. The runtime can take several
+//! inputs per forward pass, which changes the shape of both `rkllm_run` and the
+//! callback, so it is a feature rather than a setting. See [`Param`].
 
 #![warn(missing_docs)]
 
@@ -72,7 +76,7 @@ mod fake_runtime;
 
 pub use crate::error::{Error, Result};
 pub use crate::infer::{InferParams, Mode, Sampling};
-pub use crate::input::Input;
+pub use crate::input::{ImageInput, Input};
 pub use crate::output::{CallState, Chunk, Control, Output, PerfStat};
 pub use crate::param::Param;
 pub use crate::session::RkllmSession;

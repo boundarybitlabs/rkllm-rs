@@ -1,8 +1,11 @@
 [workspace]
 resolver = "3"
 members = ["crates/rkllm-sys", "crates/rkllm"]
+# Needs a second NPU runtime and a git dependency, so it stays out of the
+# default build. Build it from its own directory.
+exclude = ["examples/qwen2-vl"]
 
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/boydjohnson/rkllm-rs"
+repository = "https://github.com/boundarybitlabs/rkllm-rs"

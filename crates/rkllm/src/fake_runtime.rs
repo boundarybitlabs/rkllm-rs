@@ -8,21 +8,49 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
+use std::slice;
 use std::sync::Arc;
 
 use rkllm_sys::{
     LLMCallState, LLMHandle, LLMResultCallback, RKLLMCallback, RKLLMCrossAttnParam,
-    RKLLMInferParam, RKLLMInput, RKLLMLoraAdapter, RKLLMParam, RKLLMPerfStat, RKLLMResult,
-    RKLLMResultLastHiddenLayer, RKLLMResultLogits, RkllmApi,
+    RKLLMInferParam, RKLLMInput, RKLLMInputType, RKLLMLoraAdapter, RKLLMParam, RKLLMPerfStat,
+    RKLLMResult, RKLLMResultLastHiddenLayer, RKLLMResultLogits, RkllmApi,
 };
 
-use crate::{CallState, Control, InferParams, Input, Param, RkllmSession};
+use crate::{CallState, Control, ImageInput, InferParams, Input, Param, RkllmSession};
 
 /// What the fake hands back, one call to the trampoline per entry.
 const CHUNKS: [&str; 3] = ["Hello", ", ", "world"];
 
 struct FakeState {
     callback: LLMResultCallback,
+    seen: std::sync::Mutex<Option<SeenInput>>,
+    cleared: std::sync::Mutex<Option<(c_int, c_int, c_int)>>,
+}
+
+/// What the fake read back out of the `RKLLMInput` it was handed.
+#[derive(Debug, Clone, PartialEq)]
+struct SeenInput {
+    input_type: u32,
+    role: Option<String>,
+    prompt: String,
+    embed: Vec<f32>,
+    n_image: usize,
+    n_image_tokens: usize,
+    tags: (String, String, String),
+    size: (usize, usize),
+    video_zeroed: bool,
+}
+
+/// Reads a NUL-terminated C string, or the empty string when null.
+unsafe fn text(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -67,6 +95,8 @@ unsafe impl RkllmApi for FakeApi {
     ) -> c_int {
         let state = Box::new(FakeState {
             callback: unsafe { (*callback).result_callback },
+            seen: std::sync::Mutex::new(None),
+            cleared: std::sync::Mutex::new(None),
         });
         unsafe { *handle = Box::into_raw(state).cast::<c_void>() };
         0
@@ -75,11 +105,12 @@ unsafe impl RkllmApi for FakeApi {
     unsafe fn rkllm_run(
         &self,
         handle: LLMHandle,
-        _input: *mut RKLLMInput,
+        input: *mut RKLLMInput,
         _params: *mut RKLLMInferParam,
         userdata: *mut c_void,
     ) -> c_int {
         let state = unsafe { &*handle.cast::<FakeState>() };
+        *state.seen.lock().unwrap() = Some(unsafe { read_input(input) });
         let Some(callback) = state.callback else {
             return 0;
         };
@@ -141,15 +172,26 @@ unsafe impl RkllmApi for FakeApi {
 
     unsafe fn rkllm_clear_kv_cache(
         &self,
-        _h: LLMHandle,
-        _keep: c_int,
-        _start: *mut c_int,
-        _end: *mut c_int,
+        handle: LLMHandle,
+        keep: c_int,
+        start: *mut c_int,
+        end: *mut c_int,
     ) -> c_int {
+        let state = unsafe { &*handle.cast::<FakeState>() };
+        // Reads one entry from each array, exactly as the runtime does for a
+        // batch size of one. A wrapper that passed a shorter array would be
+        // reading out of bounds here.
+        let range = if start.is_null() || end.is_null() {
+            (keep, -1, -1)
+        } else {
+            (keep, unsafe { *start }, unsafe { *end })
+        };
+        *state.cleared.lock().unwrap() = Some(range);
         0
     }
 
     unsafe fn rkllm_get_kv_cache_size(&self, _h: LLMHandle, sizes: *mut c_int) -> c_int {
+        // Writes one entry, as the runtime does for a batch size of one.
         unsafe { *sizes = 7 };
         0
     }
@@ -183,6 +225,65 @@ unsafe impl RkllmApi for FakeApi {
     ) -> c_int {
         0
     }
+}
+
+/// Reads an `RKLLMInput` the way the real runtime would.
+unsafe fn read_input(input: *mut RKLLMInput) -> SeenInput {
+    let input = unsafe { &*input };
+    let mut seen = SeenInput {
+        input_type: input.input_type.0,
+        role: {
+            let role = unsafe { text(input.role) };
+            (!input.role.is_null()).then_some(role)
+        },
+        prompt: String::new(),
+        embed: Vec::new(),
+        n_image: 0,
+        n_image_tokens: 0,
+        tags: (String::new(), String::new(), String::new()),
+        size: (0, 0),
+        video_zeroed: true,
+    };
+
+    if input.input_type == RKLLMInputType::RKLLM_INPUT_PROMPT {
+        seen.prompt = unsafe { text(input.__bindgen_anon_1.prompt_input) };
+    } else if input.input_type == RKLLMInputType::RKLLM_INPUT_MULTIMODAL {
+        let mm = unsafe { &input.__bindgen_anon_1.multimodal_input };
+        seen.prompt = unsafe { text(mm.prompt) };
+        seen.n_image = mm.image.n_image;
+        seen.n_image_tokens = mm.image.n_image_tokens;
+        let len = mm.image.n_image * mm.image.n_image_tokens;
+        // Read exactly what a model with an embedding width of 1 would, which
+        // is enough to prove the pointer and counts arrived intact.
+        seen.embed = unsafe { slice::from_raw_parts(mm.image.image_embed, len) }.to_vec();
+        seen.tags = unsafe {
+            (
+                text(mm.image.image_start),
+                text(mm.image.image_end),
+                text(mm.image.image_content),
+            )
+        };
+        seen.size = (mm.image.image_width, mm.image.image_height);
+        let v = &mm.video;
+        seen.video_zeroed = v.video_embed.is_null()
+            && v.video_start.is_null()
+            && v.video_end.is_null()
+            && v.video_content.is_null()
+            && v.n_video == 0
+            && v.n_frame_tokens == 0
+            && v.n_frame_per_video == 0
+            && v.frame_width == 0
+            && v.frame_height == 0;
+    }
+
+    seen
+}
+
+/// What the fake recorded about the last run on this session.
+fn last_input(session: &RkllmSession<FakeApi>) -> SeenInput {
+    // SAFETY: the handle is the `FakeState` this fake allocated in rkllm_init.
+    let state = unsafe { &*session.handle().cast::<FakeState>() };
+    state.seen.lock().unwrap().clone().expect("a run happened")
 }
 
 fn session() -> RkllmSession<FakeApi> {
@@ -265,7 +366,7 @@ fn a_panicking_callback_resumes_on_the_calling_thread() {
 fn strings_reach_the_runtime_intact() {
     let session = session();
     session.set_chat_template("be brief", "", "").unwrap();
-    assert_eq!(session.kv_cache_size(1).unwrap(), vec![7]);
+    assert_eq!(session.kv_cache_size().unwrap(), 7);
 }
 
 #[test]
@@ -327,4 +428,128 @@ async fn dropping_the_stream_cancels_the_run() {
         text.push_str(chunk.unwrap().text());
     }
     assert_eq!(text, "Hello, world");
+}
+
+#[test]
+fn a_prompt_arrives_as_a_prompt() {
+    let session = session();
+    let mut input = Input::prompt("hello").unwrap().role("user").unwrap();
+
+    session
+        .run_llm(&mut input, &InferParams::new(), |_| Control::Pause)
+        .unwrap();
+
+    let seen = last_input(&session);
+    assert_eq!(seen.input_type, RKLLMInputType::RKLLM_INPUT_PROMPT.0);
+    assert_eq!(seen.prompt, "hello");
+    assert_eq!(seen.role.as_deref(), Some("user"));
+}
+
+#[test]
+fn multimodal_input_crosses_the_boundary_intact() {
+    let session = session();
+
+    // Two images, three tokens each, embedding width of one, so the values are
+    // readable back one per token.
+    let embed: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let image = ImageInput::new(embed.clone(), 2, 3)
+        .unwrap()
+        .tags("<|vision_start|>", "<|vision_end|>", "<|image_pad|>")
+        .unwrap()
+        .size(392, 392);
+    assert_eq!(image.embed_dim(), 1);
+
+    let mut input = Input::multimodal("describe these", image).unwrap();
+    session
+        .run_llm(&mut input, &InferParams::new(), |_| Control::Pause)
+        .unwrap();
+
+    let seen = last_input(&session);
+    assert_eq!(seen.input_type, RKLLMInputType::RKLLM_INPUT_MULTIMODAL.0);
+    assert_eq!(seen.prompt, "describe these");
+    assert_eq!(seen.embed, embed, "the embedding pointer survived");
+    assert_eq!((seen.n_image, seen.n_image_tokens), (2, 3));
+    assert_eq!(
+        seen.tags,
+        (
+            "<|vision_start|>".to_owned(),
+            "<|vision_end|>".to_owned(),
+            "<|image_pad|>".to_owned()
+        )
+    );
+    assert_eq!(seen.size, (392, 392));
+}
+
+#[test]
+fn the_unused_video_half_is_zeroed() {
+    let session = session();
+    let image = ImageInput::new(vec![0.0; 4], 1, 4).unwrap();
+    let mut input = Input::multimodal("x", image).unwrap();
+
+    session
+        .run_llm(&mut input, &InferParams::new(), |_| Control::Pause)
+        .unwrap();
+
+    assert!(
+        last_input(&session).video_zeroed,
+        "leaving the video block uninitialized would hand the runtime garbage"
+    );
+}
+
+#[test]
+fn an_embedding_that_does_not_divide_is_rejected() {
+    // Seven floats cannot be two images of three tokens.
+    let err = ImageInput::new(vec![0.0; 7], 2, 3).unwrap_err();
+    assert!(matches!(
+        err,
+        crate::Error::EmbeddingNotDivisible {
+            len: 7,
+            n_image: 2,
+            n_image_tokens: 3
+        }
+    ));
+
+    // Zero of either would divide by zero.
+    assert!(ImageInput::new(vec![0.0; 4], 0, 4).is_err());
+    assert!(ImageInput::new(vec![0.0; 4], 4, 0).is_err());
+}
+
+#[test]
+fn tags_default_to_empty_rather_than_null() {
+    let session = session();
+    let image = ImageInput::new(vec![0.0; 2], 1, 2).unwrap();
+    let mut input = Input::multimodal("x", image).unwrap();
+
+    session
+        .run_llm(&mut input, &InferParams::new(), |_| Control::Pause)
+        .unwrap();
+
+    let seen = last_input(&session);
+    assert_eq!(seen.tags.0, "", "an unset tag must still be a valid string");
+}
+
+#[test]
+fn clearing_a_range_passes_one_entry_per_array() {
+    let session = session();
+    session.clear_kv_cache_range(4, 9).unwrap();
+
+    // SAFETY: the handle is the `FakeState` this fake allocated.
+    let state = unsafe { &*session.handle().cast::<FakeState>() };
+    let (keep, start, end) = state.cleared.lock().unwrap().expect("a clear happened");
+
+    assert_eq!((start, end), (4, 9));
+    assert_eq!(keep, 0, "a range overrides the keep-system-prompt flag");
+}
+
+#[test]
+fn clearing_everything_passes_null_ranges() {
+    let session = session();
+    session.clear_kv_cache(true).unwrap();
+
+    // SAFETY: the handle is the `FakeState` this fake allocated.
+    let state = unsafe { &*session.handle().cast::<FakeState>() };
+    let (keep, start, end) = state.cleared.lock().unwrap().expect("a clear happened");
+
+    assert_eq!(keep, 1, "the system prompt is kept");
+    assert_eq!((start, end), (-1, -1), "null arrays mean the whole cache");
 }

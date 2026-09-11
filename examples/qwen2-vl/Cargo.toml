@@ -1,0 +1,15 @@
+[package]
+name = "qwen2-vl-example"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Image question answering on an RK3588 NPU, with Qwen2-VL split across two runtimes"
+
+[dependencies]
+rkllm = { path = "../../crates/rkllm" }
+# The vision half runs on the RKNN runtime, which is a different library from
+# the RKLLM one and lives in its own crate.
+rknpu2 = { git = "https://github.com/boundarybitlabs/rknpu2-rs", features = ["rk3576", "libloading"] }
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

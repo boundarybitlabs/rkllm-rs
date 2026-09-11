@@ -8,6 +8,15 @@ use crate::error::{Error, Result};
 
 /// Configuration for a model.
 ///
+/// # Batching is not offered
+///
+/// The runtime can process several inputs per forward pass, and the C API
+/// expresses that by having `rkllm_run` take an array of inputs and the
+/// callback receive an array of results. This crate runs one input at a time,
+/// so it does not expose `n_batch`. Setting it without changing the run path
+/// would make the runtime read past the single input it was given, which safe
+/// code must not be able to do.
+///
 /// A `Param` is a plain value: building one needs no runtime, and nothing in it
 /// is resolved until a session is created. At that point the session asks the
 /// runtime for its own defaults and lays these settings over the top, so
@@ -42,7 +51,6 @@ pub struct Param {
     skip_special_token: Option<bool>,
     ignore_eos_token: Option<bool>,
     enabled_cpus: Option<(i8, u32)>,
-    n_batch: Option<u8>,
     embed_flash: Option<bool>,
     use_cross_attn: Option<bool>,
 }
@@ -76,6 +84,9 @@ impl Param {
     }
 
     /// Number of leading key-value cache entries kept when the context shifts.
+    ///
+    /// In multi-turn chat this must be at least the length of the system
+    /// prompt, or the prompt is lost when the window moves.
     pub fn n_keep(mut self, tokens: i32) -> Self {
         self.n_keep = Some(tokens);
         self
@@ -155,12 +166,6 @@ impl Param {
         self
     }
 
-    /// How many inputs one forward pass handles. Above one enables batching.
-    pub fn n_batch(mut self, n_batch: u8) -> Self {
-        self.n_batch = Some(n_batch);
-        self
-    }
-
     /// Whether word embeddings are read from flash rather than memory.
     pub fn embed_flash(mut self, from_flash: bool) -> Self {
         self.embed_flash = Some(from_flash);
@@ -223,9 +228,6 @@ impl Param {
         if let Some((count, mask)) = self.enabled_cpus {
             raw.extend_param.enabled_cpus_num = count;
             raw.extend_param.enabled_cpus_mask = mask;
-        }
-        if let Some(v) = self.n_batch {
-            raw.extend_param.n_batch = v;
         }
         if let Some(v) = self.embed_flash {
             raw.extend_param.embed_flash = i8::from(v);

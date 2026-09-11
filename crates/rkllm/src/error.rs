@@ -24,6 +24,19 @@ pub enum Error {
     },
     /// `rkllm_init` reported success but left the handle null.
     NullHandle,
+    /// An image embedding buffer does not divide evenly into its tokens.
+    ///
+    /// The runtime reads `n_image * n_image_tokens * embed_dim` floats, and
+    /// does not carry `embed_dim`, so a buffer that is not a whole multiple of
+    /// `n_image * n_image_tokens` cannot be right.
+    EmbeddingNotDivisible {
+        /// Length of the buffer supplied.
+        len: usize,
+        /// Number of images it covers.
+        n_image: usize,
+        /// Tokens per image.
+        n_image_tokens: usize,
+    },
     /// A string destined for C contained an interior NUL byte.
     InteriorNul {
         /// Which argument the string was for.
@@ -66,6 +79,15 @@ impl fmt::Display for Error {
         match self {
             Error::Status { call, code } => write!(f, "{call} returned status {code}"),
             Error::NullHandle => f.write_str("rkllm_init succeeded but produced a null handle"),
+            Error::EmbeddingNotDivisible {
+                len,
+                n_image,
+                n_image_tokens,
+            } => write!(
+                f,
+                "an embedding of {len} floats does not divide into {n_image} images \
+                 of {n_image_tokens} tokens"
+            ),
             Error::InteriorNul { field, position } => {
                 write!(f, "{field} contains a NUL byte at offset {position}")
             }
