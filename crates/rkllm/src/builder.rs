@@ -28,6 +28,7 @@ use rkllm_sys::RkllmStatic;
 ///
 /// ```no_run
 /// # use rkllm::{Param, Result, SessionBuilder};
+/// # #[cfg(feature = "libloading")]
 /// # fn f(tokenize: impl Fn(&str) -> Vec<i32> + Send + Sync + 'static) -> Result<()> {
 /// let param = Param::new("/data/model-without-tokenizer.rkllm")?;
 /// let session = SessionBuilder::new(&param)

@@ -86,6 +86,12 @@ jobs:
       - name: Test
         run: cargo test --workspace --features rkllm/tokio
 
+      # Doc examples are compiled per feature set, and one that names a
+      # constructor the `link` build does not have only fails here. Rustdoc
+      # does not link, so this works without the library present.
+      - name: Doc tests under the link feature
+        run: cargo test --doc --workspace --no-default-features --features rkllm/link,rkllm/tokio
+
   bindings:
     name: Checked-in bindings match a fresh generation
     runs-on: ubuntu-latest
