@@ -9,11 +9,11 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["link"]
-# Resolve the RKLLM symbols at link time against librkllmrt.
-link = []
-# Resolve them at run time by dlopen-ing librkllmrt.so.
+default = ["libloading"]
+# Resolve the RKLLM symbols at run time by dlopen-ing librkllmrt.so.
 libloading = ["dep:libloading"]
+# Resolve them at link time against librkllmrt instead.
+link = []
 
 [dependencies]
 libloading = { version = "0.8", optional = true }

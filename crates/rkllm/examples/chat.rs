@@ -6,6 +6,10 @@
 //! cargo run --release --example chat -- model.rkllm "Why is the sky blue?"
 //! ```
 //!
+//! The runtime is opened with `dlopen` at startup, so nothing needs to be
+//! linked at build time. Set `RKLLM_LIB` to load it from somewhere other than
+//! the system search path.
+//!
 //! Pass `--chatml` to frame the prompt with the ChatML tags that MiniCPM4 and
 //! the Qwen family expect. Leave it off unless you need it. A converted model
 //! usually carries its own template, and the runtime warns that setting one
@@ -16,7 +20,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use rkllm::{CallState, Control, InferParams, Input, Param, PerfStat, RkllmSession};
-use rkllm_sys::Linked;
+use rkllm_sys::{LIBRARY_NAME, RkllmRuntime};
 
 const DEFAULT_PROMPT: &str = "Explain who Napoleon Bonaparte is in two or three sentences.";
 
@@ -51,7 +55,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         prompt.join(" ")
     };
 
-    let param = Param::new(&Linked, model_path.as_str())?
+    let library = std::env::var("RKLLM_LIB").unwrap_or_else(|_| LIBRARY_NAME.to_owned());
+    eprintln!("loading {library}");
+    // SAFETY: loading a shared object runs its initializers. This one is the
+    // RKLLM runtime, whose symbols the bindings were generated from.
+    let runtime = unsafe { RkllmRuntime::new(&library) }?;
+
+    let param = Param::new(&runtime, model_path.as_str())?
         .max_context_len(4096)
         .max_new_tokens(256)
         .temperature(0.7)
@@ -60,7 +70,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("loading {model_path}");
     let started = Instant::now();
-    let session = RkllmSession::new(Linked, &param)?;
+    let session = RkllmSession::new(runtime, &param)?;
     eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
 
     if chatml {

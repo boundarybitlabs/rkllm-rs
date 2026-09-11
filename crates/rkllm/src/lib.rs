@@ -29,16 +29,20 @@
 //! # }
 //! ```
 //!
-//! With the default `link` feature, `api` above is `rkllm_sys::Linked`, a
-//! zero-sized value. With `libloading` it is an `RkllmRuntime` you loaded.
+//! With the default `libloading` feature, `api` above is an `RkllmRuntime` you
+//! opened with `dlopen`. With `link` it is `rkllm_sys::Linked`, a zero-sized
+//! value over symbols the linker resolved.
 //!
 //! # Which bindings
 //!
 //! [`RkllmSession`] is generic over the `rkllm-sys` binding flavour. With the
-//! default `link` feature that is `Linked`, a zero-sized type over symbols the
-//! linker resolved. With the `libloading` feature it can instead be an
-//! `RkllmRuntime` loaded at run time, and `Arc<RkllmRuntime>` works too, so
-//! several sessions can share one loaded library.
+//! default `libloading` feature that is an `RkllmRuntime`, opened at run time,
+//! so a build needs no `librkllmrt` present at all. `Arc<RkllmRuntime>` works
+//! too, letting several sessions share one loaded library.
+//!
+//! With the `link` feature instead it is `Linked`, a zero-sized type over
+//! symbols the linker resolved, which means the library must be available at
+//! build time.
 //!
 //! # Not wrapped yet
 //!

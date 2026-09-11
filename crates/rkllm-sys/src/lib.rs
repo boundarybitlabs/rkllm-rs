@@ -6,18 +6,22 @@
 //!
 //! | Flavour | Feature | Symbols resolved |
 //! |---|---|---|
-//! | [`Linked`] | `link` (default) | by the linker, at build time |
-//! | [`RkllmRuntime`] | `libloading` | by `dlopen`, at run time |
+//! | [`RkllmRuntime`] | `libloading` (default) | by `dlopen`, at run time |
+//! | [`Linked`] | `link` | by the linker, at build time |
 //!
 //! Both implement [`RkllmApi`], so a caller can be generic over which one it
 //! got. Everything here is `unsafe` and maps one-to-one onto the C API. The
 //! safe wrapper lives in the `rkllm` crate.
 //!
-//! # Linking
+//! # Finding the runtime
 //!
-//! With the `link` feature the build script asks the linker for `rkllmrt`. Set
-//! `RKLLM_LIB_DIR` to the directory holding `librkllmrt.so` if it is not on the
-//! default search path.
+//! The default `libloading` feature resolves nothing at build time, so a build
+//! needs no `librkllmrt` at all. Load it at run time with
+//! [`RkllmRuntime::new`], passing a path or [`LIBRARY_NAME`].
+//!
+//! With the `link` feature instead, the build script asks the linker for
+//! `rkllmrt`. Set `RKLLM_LIB_DIR` to the directory holding `librkllmrt.so` if
+//! it is not on the default search path.
 //!
 //! # Regenerating
 //!

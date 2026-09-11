@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use futures_util::StreamExt as _;
 use rkllm::{CallState, InferParams, Input, Param, RkllmSession};
-use rkllm_sys::Linked;
+use rkllm_sys::{LIBRARY_NAME, RkllmRuntime};
 
 const DEFAULT_PROMPT: &str = "Explain who Napoleon Bonaparte is in two or three sentences.";
 
@@ -52,13 +52,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         prompt.join(" ")
     };
 
-    let param = Param::new(&Linked, model_path.as_str())?
+    let library = std::env::var("RKLLM_LIB").unwrap_or_else(|_| LIBRARY_NAME.to_owned());
+    eprintln!("loading {library}");
+    // SAFETY: loading a shared object runs its initializers. This one is the
+    // RKLLM runtime, whose symbols the bindings were generated from.
+    let runtime = unsafe { RkllmRuntime::new(&library) }?;
+
+    let param = Param::new(&runtime, model_path.as_str())?
         .max_context_len(4096)
         .max_new_tokens(256)
         .temperature(0.7);
 
     eprintln!("loading {model_path}");
-    let session = Arc::new(RkllmSession::new(Linked, &param)?);
+    let session = Arc::new(RkllmSession::new(runtime, &param)?);
     eprintln!("\n> {prompt}\n");
 
     let mut stream = session.run_llm_async(Input::prompt(prompt.as_str())?, InferParams::new());

@@ -7,11 +7,11 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["link"]
-# Resolve the RKLLM symbols at link time.
-link = ["rkllm-sys/link"]
-# Resolve them at run time by dlopen-ing librkllmrt.so.
+default = ["libloading"]
+# Resolve the RKLLM symbols at run time by dlopen-ing librkllmrt.so.
 libloading = ["rkllm-sys/libloading"]
+# Resolve them at link time instead.
+link = ["rkllm-sys/link"]
 # Adds RkllmSession::run_llm_async, which yields a Stream of chunks.
 tokio = ["dep:tokio", "dep:futures-core"]
 
@@ -26,11 +26,11 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros"] 
 
 [[example]]
 name = "chat"
-required-features = ["link"]
+required-features = ["libloading"]
 
 [[example]]
 name = "stream"
-required-features = ["link", "tokio"]
+required-features = ["libloading", "tokio"]
 
 [package.metadata.docs.rs]
 all-features = true
