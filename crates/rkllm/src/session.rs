@@ -4,9 +4,11 @@ use std::any::Any;
 use std::ffi::CString;
 use std::os::raw::{c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::path::Path;
 use std::ptr;
 use std::sync::{Mutex, MutexGuard, PoisonError};
+
+#[cfg(feature = "libloading")]
+use std::path::Path;
 
 #[cfg(feature = "libloading")]
 use rkllm_sys::RkllmRuntime;

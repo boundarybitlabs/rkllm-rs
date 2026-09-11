@@ -52,6 +52,11 @@
 
 #![warn(missing_docs)]
 
+// Without a flavour there is no way to reach librkllmrt, and no constructor
+// exists, so every path through this crate is unreachable.
+#[cfg(not(any(feature = "libloading", feature = "link")))]
+compile_error!("rkllm needs one of its `libloading` (default) or `link` features enabled");
+
 pub mod error;
 pub mod infer;
 pub mod input;

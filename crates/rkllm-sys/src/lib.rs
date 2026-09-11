@@ -47,23 +47,33 @@ pub const LIBRARY_NAME: &str = "librkllmrt.so";
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "link", feature = "libloading"))]
     use super::*;
 
-    /// Both binding flavours must satisfy the one trait, and it must stay
-    /// usable behind a `dyn` pointer so callers can pick at run time.
+    #[cfg(any(feature = "link", feature = "libloading"))]
+    fn assert_impl<T: RkllmApi>() {}
+
+    /// The linked flavour must satisfy the trait, and it must stay usable
+    /// behind a `dyn` pointer so callers can pick at run time.
+    #[cfg(feature = "link")]
     #[test]
-    fn both_flavours_implement_the_api() {
-        fn assert_impl<T: RkllmApi>() {}
+    fn the_linked_flavour_implements_the_api() {
+        assert_impl::<RkllmStatic>();
+        let _: &dyn RkllmApi = &RkllmStatic::new();
+    }
 
-        #[cfg(feature = "link")]
-        {
-            assert_impl::<RkllmStatic>();
-            let _: &dyn RkllmApi = &RkllmStatic::new();
-        }
-
-        #[cfg(feature = "libloading")]
+    /// The runtime-loaded flavour must satisfy the same trait.
+    #[cfg(feature = "libloading")]
+    #[test]
+    fn the_runtime_flavour_implements_the_api() {
         assert_impl::<RkllmRuntime>();
+    }
 
-        fn _object_safe(_: &dyn RkllmApi) {}
+    /// Wrappers forward, so a shared library can back several sessions.
+    #[cfg(feature = "libloading")]
+    #[test]
+    fn wrappers_forward_the_api() {
+        assert_impl::<std::sync::Arc<RkllmRuntime>>();
+        assert_impl::<Box<dyn RkllmApi>>();
     }
 }
