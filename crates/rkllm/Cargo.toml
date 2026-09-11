@@ -1,0 +1,15 @@
+[package]
+name = "rkllm"
+version = "0.1.0"
+description = "Safe Rust bindings to the Rockchip RKLLM runtime"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["link"]
+link = ["rkllm-sys/link"]
+libloading = ["rkllm-sys/libloading"]
+
+[dependencies]
+rkllm-sys = { version = "0.1.0", path = "../rkllm-sys", default-features = false }

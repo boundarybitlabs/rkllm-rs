@@ -1,0 +1,19 @@
+[package]
+name = "rkllm-sys"
+version = "0.1.0"
+description = "Raw FFI bindings to librkllmrt, the Rockchip RKLLM runtime"
+links = "rkllmrt"
+build = "build.rs"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["link"]
+# Resolve the RKLLM symbols at link time against librkllmrt.
+link = []
+# Resolve them at run time by dlopen-ing librkllmrt.so.
+libloading = ["dep:libloading"]
+
+[dependencies]
+libloading = { version = "0.8", optional = true }
