@@ -24,6 +24,23 @@ pub enum Error {
     },
     /// `rkllm_init` reported success but left the handle null.
     NullHandle,
+    /// A batch size of zero was asked for.
+    ZeroBatch,
+    /// A call supplied the wrong number of entries for the session's batch size.
+    ///
+    /// The runtime reads exactly `expected` of whatever was passed, so a
+    /// shorter slice would have it read past the end.
+    BatchSizeMismatch {
+        /// What the session was built with.
+        expected: usize,
+        /// What the caller supplied.
+        given: usize,
+    },
+    /// A single-input call was made on a session built for a larger batch.
+    NotSingleBatch {
+        /// The session's batch size.
+        n_batch: usize,
+    },
     /// An image embedding buffer does not divide evenly into its tokens.
     ///
     /// The runtime reads `n_image * n_image_tokens * embed_dim` floats, and
@@ -79,6 +96,15 @@ impl fmt::Display for Error {
         match self {
             Error::Status { call, code } => write!(f, "{call} returned status {code}"),
             Error::NullHandle => f.write_str("rkllm_init succeeded but produced a null handle"),
+            Error::ZeroBatch => f.write_str("a batch size of zero runs nothing"),
+            Error::BatchSizeMismatch { expected, given } => write!(
+                f,
+                "this session runs {expected} inputs per batch, but {given} were given"
+            ),
+            Error::NotSingleBatch { n_batch } => write!(
+                f,
+                "this session runs {n_batch} inputs per batch, so use the batch call"
+            ),
             Error::EmbeddingNotDivisible {
                 len,
                 n_image,

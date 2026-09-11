@@ -50,9 +50,10 @@
 //! callbacks are reachable through `rkllm-sys` but have no safe wrapper here.
 //! Image input is wrapped, see [`ImageInput`].
 //!
-//! Multi-batch inference is not offered either. The runtime can take several
-//! inputs per forward pass, which changes the shape of both `rkllm_run` and the
-//! callback, so it is a feature rather than a setting. See [`Param`].
+//! Multi-batch inference is wrapped. Set [`Param::n_batch`] and run with
+//! [`RkllmSession::run_llm_batch`], which takes one input per entry and reports
+//! one output per entry. Streaming stays single-input, since one `Stream`
+//! cannot carry several independent generations.
 
 #![warn(missing_docs)]
 

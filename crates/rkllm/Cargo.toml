@@ -30,6 +30,10 @@ name = "chat"
 required-features = ["libloading"]
 
 [[example]]
+name = "batch"
+required-features = ["libloading"]
+
+[[example]]
 name = "stream"
 required-features = ["libloading", "tokio"]
 

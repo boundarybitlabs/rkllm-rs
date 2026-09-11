@@ -37,6 +37,11 @@ where
     /// logits are left behind, since they are large and borrowed. Use
     /// [`RkllmSession::run_llm`] directly for those.
     ///
+    /// This is a single-input call. One stream cannot carry several
+    /// independent generations, so on a session built for a larger batch the
+    /// first item is an [`Error::NotSingleBatch`] and the stream then ends.
+    /// Use [`RkllmSession::run_llm_batch`] for those.
+    ///
     /// ```no_run
     /// # use futures_util::StreamExt as _;
     /// # use rkllm::{InferParams, Input, RkllmSession, Result};

@@ -167,6 +167,15 @@ impl<'a> Output<'a> {
         Some(unsafe { slice::from_raw_parts(logits.logits, len) })
     }
 
+    /// Whether this batch entry has stopped generating.
+    ///
+    /// The runtime signals a finished batch with a negative token id. In a
+    /// multi-batch run the others keep going, and the run ends when every entry
+    /// has finished.
+    pub fn is_finished(&self) -> bool {
+        self.token_id().is_some_and(|id| id < 0)
+    }
+
     /// Timings for the run. Only meaningful once the state is [`CallState::Finish`].
     pub fn perf(&self) -> Option<PerfStat> {
         self.result.map(|r| PerfStat::from(r.perf))
@@ -203,6 +212,8 @@ pub struct Chunk {
     /// The generated text, when there was valid UTF-8 text to copy.
     pub text: Option<String>,
     /// The id of the token that produced this chunk.
+    ///
+    /// Negative means this batch entry has finished.
     pub token_id: Option<i32>,
     /// Timings, populated on the final chunk.
     pub perf: Option<PerfStat>,
