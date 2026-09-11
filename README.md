@@ -128,8 +128,9 @@ Exercised end to end on this combination:
 | NPU driver | 0.9.8 |
 | Model | MiniCPM4-0.5B, `w8a8_g128`, converted with toolkit 1.2.1 |
 
-Generation ran at roughly 24.5 tokens per second with 633 MB resident. Other
-Rockchip platforms are untested here.
+Generation ran at roughly 24.5 tokens per second with 633 MB resident. A batch
+of four raised that to roughly 39 tokens per second across all four, on the same
+model and about the same memory. Other Rockchip platforms are untested here.
 
 ## Regenerating the bindings
 
