@@ -444,3 +444,144 @@ unsafe impl RkllmApi for RkllmRuntime {
         unsafe { RkllmRuntime::rkllm_set_cross_attn_params(self, handle, cross_attn_params) }
     }
 }
+
+/// Forwards every [`RkllmApi`] method to `**self`.
+macro_rules! forward_rkllm_api {
+    () => {
+        unsafe fn rkllm_createDefaultParam(&self) -> RKLLMParam {
+            unsafe { (**self).rkllm_createDefaultParam() }
+        }
+
+        unsafe fn rkllm_init(
+            &self,
+            handle: *mut LLMHandle,
+            param: *mut RKLLMParam,
+            callback: *mut RKLLMCallback,
+        ) -> c_int {
+            unsafe { (**self).rkllm_init(handle, param, callback) }
+        }
+
+        unsafe fn rkllm_load_lora(
+            &self,
+            handle: LLMHandle,
+            lora_adapter: *mut RKLLMLoraAdapter,
+        ) -> c_int {
+            unsafe { (**self).rkllm_load_lora(handle, lora_adapter) }
+        }
+
+        unsafe fn rkllm_load_prompt_cache(
+            &self,
+            handle: LLMHandle,
+            prompt_cache_path: *const c_char,
+        ) -> c_int {
+            unsafe { (**self).rkllm_load_prompt_cache(handle, prompt_cache_path) }
+        }
+
+        unsafe fn rkllm_release_prompt_cache(&self, handle: LLMHandle) -> c_int {
+            unsafe { (**self).rkllm_release_prompt_cache(handle) }
+        }
+
+        unsafe fn rkllm_destroy(&self, handle: LLMHandle) -> c_int {
+            unsafe { (**self).rkllm_destroy(handle) }
+        }
+
+        unsafe fn rkllm_run(
+            &self,
+            handle: LLMHandle,
+            rkllm_input: *mut RKLLMInput,
+            rkllm_infer_params: *mut RKLLMInferParam,
+            userdata: *mut c_void,
+        ) -> c_int {
+            unsafe { (**self).rkllm_run(handle, rkllm_input, rkllm_infer_params, userdata) }
+        }
+
+        unsafe fn rkllm_run_async(
+            &self,
+            handle: LLMHandle,
+            rkllm_input: *mut RKLLMInput,
+            rkllm_infer_params: *mut RKLLMInferParam,
+            userdata: *mut c_void,
+        ) -> c_int {
+            unsafe { (**self).rkllm_run_async(handle, rkllm_input, rkllm_infer_params, userdata) }
+        }
+
+        unsafe fn rkllm_abort(&self, handle: LLMHandle) -> c_int {
+            unsafe { (**self).rkllm_abort(handle) }
+        }
+
+        unsafe fn rkllm_is_running(&self, handle: LLMHandle) -> c_int {
+            unsafe { (**self).rkllm_is_running(handle) }
+        }
+
+        unsafe fn rkllm_clear_kv_cache(
+            &self,
+            handle: LLMHandle,
+            keep_system_prompt: c_int,
+            start_pos: *mut c_int,
+            end_pos: *mut c_int,
+        ) -> c_int {
+            unsafe { (**self).rkllm_clear_kv_cache(handle, keep_system_prompt, start_pos, end_pos) }
+        }
+
+        unsafe fn rkllm_get_kv_cache_size(
+            &self,
+            handle: LLMHandle,
+            cache_sizes: *mut c_int,
+        ) -> c_int {
+            unsafe { (**self).rkllm_get_kv_cache_size(handle, cache_sizes) }
+        }
+
+        unsafe fn rkllm_set_chat_template(
+            &self,
+            handle: LLMHandle,
+            system_prompt: *const c_char,
+            prompt_prefix: *const c_char,
+            prompt_postfix: *const c_char,
+        ) -> c_int {
+            unsafe {
+                (**self).rkllm_set_chat_template(
+                    handle,
+                    system_prompt,
+                    prompt_prefix,
+                    prompt_postfix,
+                )
+            }
+        }
+
+        unsafe fn rkllm_set_function_tools(
+            &self,
+            handle: LLMHandle,
+            system_prompt: *const c_char,
+            tools: *const c_char,
+            tool_response_str: *const c_char,
+        ) -> c_int {
+            unsafe {
+                (**self).rkllm_set_function_tools(handle, system_prompt, tools, tool_response_str)
+            }
+        }
+
+        unsafe fn rkllm_set_cross_attn_params(
+            &self,
+            handle: LLMHandle,
+            cross_attn_params: *mut RKLLMCrossAttnParam,
+        ) -> c_int {
+            unsafe { (**self).rkllm_set_cross_attn_params(handle, cross_attn_params) }
+        }
+    };
+}
+
+// SAFETY: each impl only dereferences to the inner `RkllmApi` and forwards.
+#[allow(non_snake_case)]
+unsafe impl<T: RkllmApi + ?Sized> RkllmApi for &T {
+    forward_rkllm_api!();
+}
+
+#[allow(non_snake_case)]
+unsafe impl<T: RkllmApi + ?Sized> RkllmApi for std::boxed::Box<T> {
+    forward_rkllm_api!();
+}
+
+#[allow(non_snake_case)]
+unsafe impl<T: RkllmApi + ?Sized> RkllmApi for std::sync::Arc<T> {
+    forward_rkllm_api!();
+}
