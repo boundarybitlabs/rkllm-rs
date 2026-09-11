@@ -25,12 +25,15 @@ hardware.
 Version 0.1.0. The API is unstable.
 
 Wrapped: model loading, text generation with a callback or a `Stream`, prompt,
-token and embedding inputs, chat templates, function-calling configuration,
-LoRA adapters, prompt caches, key-value cache control, and per-run sampling
-overrides.
+token, embedding and image inputs, chat templates, function-calling
+configuration, LoRA adapters, prompt caches, key-value cache control, and
+per-run sampling overrides.
 
-Not wrapped: multimodal input, cross-attention parameters, and the tokenizer
-and embedding callbacks. All three remain reachable through `rkllm-sys`.
+Not wrapped: video input, cross-attention parameters, and the tokenizer and
+embedding callbacks. All three remain reachable through `rkllm-sys`.
+
+RKLLM does not encode images. Embeddings come from a separate RKNN vision
+model, which [`examples/qwen2-vl`](examples/qwen2-vl) demonstrates end to end.
 
 ## Getting started
 
