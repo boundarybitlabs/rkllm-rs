@@ -10,12 +10,13 @@
 //! linked at build time.
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::Parser;
+use rkllm::find_library_path;
 use rkllm::{CallState, Control, InferParams, Input, Param, PerfStat, RkllmSession};
-use rkllm_sys::LIBRARY_NAME;
 
 const DEFAULT_PROMPT: &str = "Explain who Napoleon Bonaparte is in two or three sentences.";
 
@@ -38,8 +39,11 @@ struct Args {
     chatml: bool,
 
     /// The RKLLM shared library to open.
-    #[arg(long, env = "RKLLM_LIB", default_value = LIBRARY_NAME)]
-    library: String,
+    ///
+    /// Defaults to the first one found, which honours RKLLM_LIB and
+    /// RKLLM_LIB_DIR before falling back to the usual system directories.
+    #[arg(long)]
+    library: Option<PathBuf>,
 
     /// Tokens the context window holds.
     #[arg(long, default_value_t = 4096)]
@@ -79,6 +83,13 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         args.prompt.join(" ")
     };
 
+    let library = match args.library {
+        Some(path) => path,
+        None => find_library_path()
+            .next()
+            .ok_or("no librkllmrt.so found; pass --library or set RKLLM_LIB")?,
+    };
+
     let param = Param::new(args.model.as_str())?
         .max_context_len(args.max_context_len)
         .max_new_tokens(args.max_new_tokens)
@@ -86,9 +97,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .top_k(args.top_k)
         .top_p(args.top_p);
 
-    eprintln!("loading {} via {}", args.model, args.library);
+    eprintln!("loading {} via {}", args.model, library.display());
     let started = Instant::now();
-    let session = RkllmSession::new_with_library(&args.library, &param)?;
+    let session = RkllmSession::new_with_library(&library, &param)?;
     eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
 
     if args.chatml {

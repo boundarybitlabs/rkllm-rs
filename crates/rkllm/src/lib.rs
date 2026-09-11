@@ -75,5 +75,8 @@ pub use crate::session::RkllmSession;
 #[cfg(feature = "tokio")]
 pub use crate::stream::ChunkStream;
 
+/// Locating `librkllmrt.so` on disk, re-exported from `rkllm-sys`.
+pub use rkllm_sys::{LIBRARY_NAME, find_library_path};
+
 #[doc(no_inline)]
 pub use rkllm_sys;

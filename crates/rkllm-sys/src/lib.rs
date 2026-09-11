@@ -32,8 +32,10 @@
 //! commit, or `RKLLM_HEADER` to point at a local copy.
 
 mod bindings;
+mod find;
 
 pub use bindings::*;
+pub use find::find_library_path;
 
 /// The `libloading` crate the runtime bindings are built on, re-exported so
 /// that dependents can name its error type without depending on it directly.
