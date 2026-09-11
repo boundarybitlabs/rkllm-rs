@@ -49,6 +49,10 @@
 //! Video input, cross-attention parameters, and the tokenizer and embedding
 //! callbacks are reachable through `rkllm-sys` but have no safe wrapper here.
 //! Image input is wrapped, see [`ImageInput`].
+//!
+//! Multi-batch inference is not offered either. The runtime can take several
+//! inputs per forward pass, which changes the shape of both `rkllm_run` and the
+//! callback, so it is a feature rather than a setting. See [`Param`].
 
 #![warn(missing_docs)]
 

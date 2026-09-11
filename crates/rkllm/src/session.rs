@@ -237,19 +237,25 @@ impl<A: RkllmApi> RkllmSession<A> {
         Error::check("rkllm_clear_kv_cache", code)
     }
 
-    /// Clears one half-open range of the key-value cache per batch entry.
+    /// Clears one half-open range of the key-value cache.
     ///
-    /// Both slices must have one element per batch entry, and the runtime
-    /// ignores the system-prompt flag when a range is given.
-    pub fn clear_kv_cache_range(&self, start: &mut [c_int], end: &mut [c_int]) -> Result<()> {
-        assert_eq!(
-            start.len(),
-            end.len(),
-            "start and end must have one entry per batch"
-        );
+    /// # The runtime ignores this unless the run is paused
+    ///
+    /// A range only takes effect when the run was configured with
+    /// [`InferParams::keep_history`] set to `false`
+    /// and is currently suspended, which means the callback returned
+    /// [`Control::Pause`]. Outside that, the call
+    /// succeeds and changes nothing.
+    ///
+    /// Use [`RkllmSession::clear_kv_cache`] to clear the whole cache instead.
+    pub fn clear_kv_cache_range(&self, start: c_int, end: c_int) -> Result<()> {
         let _guard = self.lock_run();
-        // SAFETY: the handle is live, and both arrays are valid for the length
-        // the runtime reads, which is one entry per batch.
+        // One entry each, because this crate runs one input at a time. See the
+        // note on `Param` about why batching is not exposed.
+        let mut start = [start];
+        let mut end = [end];
+        // SAFETY: the handle is live, and both arrays hold the one entry the
+        // runtime reads for a batch size of one.
         let code = unsafe {
             self.api
                 .rkllm_clear_kv_cache(self.handle, 0, start.as_mut_ptr(), end.as_mut_ptr())
@@ -257,17 +263,20 @@ impl<A: RkllmApi> RkllmSession<A> {
         Error::check("rkllm_clear_kv_cache", code)
     }
 
-    /// Reads the current key-value cache size, one entry per batch.
-    pub fn kv_cache_size(&self, n_batch: usize) -> Result<Vec<c_int>> {
-        let mut sizes = vec![0; n_batch];
+    /// Reads how many positions the key-value cache currently holds.
+    pub fn kv_cache_size(&self) -> Result<c_int> {
+        // Sized here rather than by the caller: a length shorter than the
+        // runtime's batch size would have it write out of bounds.
+        let mut sizes = [0 as c_int];
         let _guard = self.lock_run();
-        // SAFETY: the handle is live and `sizes` has the requested length.
+        // SAFETY: the handle is live, and the array holds the one entry the
+        // runtime writes for a batch size of one.
         let code = unsafe {
             self.api
                 .rkllm_get_kv_cache_size(self.handle, sizes.as_mut_ptr())
         };
         Error::check("rkllm_get_kv_cache_size", code)?;
-        Ok(sizes)
+        Ok(sizes[0])
     }
 
     /// Sets the chat template framing each turn.

@@ -29,8 +29,13 @@ token, embedding and image inputs, chat templates, function-calling
 configuration, LoRA adapters, prompt caches, key-value cache control, and
 per-run sampling overrides.
 
-Not wrapped: video input, cross-attention parameters, and the tokenizer and
-embedding callbacks. All three remain reachable through `rkllm-sys`.
+Not wrapped: video input, cross-attention parameters, multi-batch inference,
+and the tokenizer and embedding callbacks. All of them remain reachable through
+`rkllm-sys`.
+
+Multi-batch changes the shape of both `rkllm_run` and the callback, from one
+input and one result to arrays of them. It is a feature rather than a setting,
+so this crate runs one input at a time and does not expose `n_batch`.
 
 RKLLM does not encode images. Embeddings come from a separate RKNN vision
 model, which [`examples/qwen2-vl`](examples/qwen2-vl) demonstrates end to end.

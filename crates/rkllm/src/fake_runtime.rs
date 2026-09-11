@@ -25,6 +25,7 @@ const CHUNKS: [&str; 3] = ["Hello", ", ", "world"];
 struct FakeState {
     callback: LLMResultCallback,
     seen: std::sync::Mutex<Option<SeenInput>>,
+    cleared: std::sync::Mutex<Option<(c_int, c_int, c_int)>>,
 }
 
 /// What the fake read back out of the `RKLLMInput` it was handed.
@@ -95,6 +96,7 @@ unsafe impl RkllmApi for FakeApi {
         let state = Box::new(FakeState {
             callback: unsafe { (*callback).result_callback },
             seen: std::sync::Mutex::new(None),
+            cleared: std::sync::Mutex::new(None),
         });
         unsafe { *handle = Box::into_raw(state).cast::<c_void>() };
         0
@@ -170,15 +172,26 @@ unsafe impl RkllmApi for FakeApi {
 
     unsafe fn rkllm_clear_kv_cache(
         &self,
-        _h: LLMHandle,
-        _keep: c_int,
-        _start: *mut c_int,
-        _end: *mut c_int,
+        handle: LLMHandle,
+        keep: c_int,
+        start: *mut c_int,
+        end: *mut c_int,
     ) -> c_int {
+        let state = unsafe { &*handle.cast::<FakeState>() };
+        // Reads one entry from each array, exactly as the runtime does for a
+        // batch size of one. A wrapper that passed a shorter array would be
+        // reading out of bounds here.
+        let range = if start.is_null() || end.is_null() {
+            (keep, -1, -1)
+        } else {
+            (keep, unsafe { *start }, unsafe { *end })
+        };
+        *state.cleared.lock().unwrap() = Some(range);
         0
     }
 
     unsafe fn rkllm_get_kv_cache_size(&self, _h: LLMHandle, sizes: *mut c_int) -> c_int {
+        // Writes one entry, as the runtime does for a batch size of one.
         unsafe { *sizes = 7 };
         0
     }
@@ -353,7 +366,7 @@ fn a_panicking_callback_resumes_on_the_calling_thread() {
 fn strings_reach_the_runtime_intact() {
     let session = session();
     session.set_chat_template("be brief", "", "").unwrap();
-    assert_eq!(session.kv_cache_size(1).unwrap(), vec![7]);
+    assert_eq!(session.kv_cache_size().unwrap(), 7);
 }
 
 #[test]
@@ -513,4 +526,30 @@ fn tags_default_to_empty_rather_than_null() {
 
     let seen = last_input(&session);
     assert_eq!(seen.tags.0, "", "an unset tag must still be a valid string");
+}
+
+#[test]
+fn clearing_a_range_passes_one_entry_per_array() {
+    let session = session();
+    session.clear_kv_cache_range(4, 9).unwrap();
+
+    // SAFETY: the handle is the `FakeState` this fake allocated.
+    let state = unsafe { &*session.handle().cast::<FakeState>() };
+    let (keep, start, end) = state.cleared.lock().unwrap().expect("a clear happened");
+
+    assert_eq!((start, end), (4, 9));
+    assert_eq!(keep, 0, "a range overrides the keep-system-prompt flag");
+}
+
+#[test]
+fn clearing_everything_passes_null_ranges() {
+    let session = session();
+    session.clear_kv_cache(true).unwrap();
+
+    // SAFETY: the handle is the `FakeState` this fake allocated.
+    let state = unsafe { &*session.handle().cast::<FakeState>() };
+    let (keep, start, end) = state.cleared.lock().unwrap().expect("a clear happened");
+
+    assert_eq!(keep, 1, "the system prompt is kept");
+    assert_eq!((start, end), (-1, -1), "null arrays mean the whole cache");
 }
