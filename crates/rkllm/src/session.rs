@@ -20,6 +20,7 @@ use rkllm_sys::{
 };
 
 use crate::error::{Error, Result};
+use crate::hooks::{Hooks, embedding_trampoline, tokenizer_trampoline};
 use crate::infer::InferParams;
 use crate::input::Input;
 use crate::output::{CallState, Control, Output};
@@ -48,6 +49,9 @@ pub struct RkllmSession<A: RkllmApi> {
     api: A,
     handle: LLMHandle,
     n_batch: usize,
+    /// Boxed so its address survives this struct being moved, since
+    /// `rkllm_init` was already told where to find it.
+    _hooks: Box<Hooks>,
     run_lock: Mutex<()>,
 }
 
@@ -66,11 +70,21 @@ impl<A: RkllmApi> RkllmSession<A> {
     /// the flavour they want, so the bindings stay an implementation detail
     /// rather than something every call site has to name.
     pub(crate) fn with_api(api: A, param: &Param) -> Result<Self> {
+        Self::with_api_and_hooks(api, param, Hooks::default())
+    }
+
+    /// As [`RkllmSession::with_api`], with callbacks the model may require.
+    pub(crate) fn with_api_and_hooks(api: A, param: &Param, hooks: Hooks) -> Result<Self> {
         // Start from this runtime's own defaults, then lay the caller's
         // settings over the top.
         // SAFETY: the call takes no arguments and returns a plain value.
         let mut raw_param = unsafe { api.rkllm_createDefaultParam() };
         param.apply_to(&mut raw_param);
+
+        // Boxed before init, so the address handed to the runtime is the one the
+        // session goes on owning.
+        let hooks = Box::new(hooks);
+        let hooks_ptr = (&raw const *hooks).cast_mut().cast::<c_void>();
 
         let mut handle: LLMHandle = ptr::null_mut();
         let mut callback = RKLLMCallback {
@@ -78,10 +92,26 @@ impl<A: RkllmApi> RkllmSession<A> {
             // Left null on purpose. The per-run `userdata` argument of
             // `rkllm_run` takes precedence, and that is where the closure goes.
             result_userdata: ptr::null_mut(),
-            tokenizer_callback: None,
-            tokenizer_userdata: ptr::null_mut(),
-            embed_callback: None,
-            embed_userdata: ptr::null_mut(),
+            // Registered only when supplied, so a model with its own tokenizer
+            // or embedding layer goes on using it.
+            tokenizer_callback: hooks
+                .tokenizer
+                .is_some()
+                .then_some(tokenizer_trampoline as unsafe extern "C" fn(_, _, _, _, _) -> _),
+            tokenizer_userdata: if hooks.tokenizer.is_some() {
+                hooks_ptr
+            } else {
+                ptr::null_mut()
+            },
+            embed_callback: hooks
+                .embedding
+                .is_some()
+                .then_some(embedding_trampoline as unsafe extern "C" fn(_, _, _, _, _) -> _),
+            embed_userdata: if hooks.embedding.is_some() {
+                hooks_ptr
+            } else {
+                ptr::null_mut()
+            },
         };
 
         // SAFETY: all three pointers are to live, initialized values, and the
@@ -101,6 +131,7 @@ impl<A: RkllmApi> RkllmSession<A> {
             api,
             handle,
             n_batch,
+            _hooks: hooks,
             run_lock: Mutex::new(()),
         })
     }

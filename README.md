@@ -34,8 +34,12 @@ run with `RkllmSession::run_llm_batch`, which takes one input per entry and
 reports one output per entry. Streaming stays single-input, since one `Stream`
 cannot carry several independent generations.
 
-Not wrapped: video input, cross-attention parameters, and the tokenizer and
-embedding callbacks. All three remain reachable through `rkllm-sys`.
+Also wrapped: the tokenizer and embedding callbacks, for models exported
+without their own. Supply them through `SessionBuilder`, which is what makes
+such a model load at all.
+
+Not wrapped: video input and cross-attention parameters. Both remain reachable
+through `rkllm-sys`.
 
 RKLLM does not encode images. Embeddings come from a separate RKNN vision
 model, which [`examples/qwen2-vl`](examples/qwen2-vl) demonstrates end to end.

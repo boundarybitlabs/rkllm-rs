@@ -12,18 +12,27 @@ use std::slice;
 use std::sync::Arc;
 
 use rkllm_sys::{
-    LLMCallState, LLMHandle, LLMResultCallback, RKLLMCallback, RKLLMCrossAttnParam,
-    RKLLMInferParam, RKLLMInput, RKLLMInputType, RKLLMLoraAdapter, RKLLMParam, RKLLMPerfStat,
-    RKLLMResult, RKLLMResultLastHiddenLayer, RKLLMResultLogits, RkllmApi,
+    LLMCallState, LLMGetEmbedCallback, LLMHandle, LLMResultCallback, LLMTokenizerCallback,
+    RKLLMCallback, RKLLMCrossAttnParam, RKLLMInferParam, RKLLMInput, RKLLMInputType,
+    RKLLMLoraAdapter, RKLLMParam, RKLLMPerfStat, RKLLMResult, RKLLMResultLastHiddenLayer,
+    RKLLMResultLogits, RkllmApi,
 };
 
-use crate::{CallState, Control, ImageInput, InferParams, Input, Param, RkllmSession};
+use crate::{
+    CallState, Control, ImageInput, InferParams, Input, Param, RkllmSession, SessionBuilder,
+};
 
 /// What the fake hands back, one call to the trampoline per entry.
 const CHUNKS: [&str; 3] = ["Hello", ", ", "world"];
 
 struct FakeState {
     callback: LLMResultCallback,
+    /// The callbacks a model without its own tokenizer or embedding layer
+    /// would need, with the userdata they were registered alongside.
+    tokenizer: (LLMTokenizerCallback, *mut c_void),
+    embed: (LLMGetEmbedCallback, *mut c_void),
+    tokenized: std::sync::Mutex<Option<(c_int, Vec<i32>)>>,
+    embedded: std::sync::Mutex<Option<(c_int, Vec<f32>)>>,
     /// What `rkllm_init` was told the batch size would be.
     n_batch: usize,
     seen: std::sync::Mutex<Vec<SeenInput>>,
@@ -98,6 +107,15 @@ unsafe impl RkllmApi for FakeApi {
     ) -> c_int {
         let state = Box::new(FakeState {
             callback: unsafe { (*callback).result_callback },
+            tokenizer: unsafe {
+                (
+                    (*callback).tokenizer_callback,
+                    (*callback).tokenizer_userdata,
+                )
+            },
+            embed: unsafe { ((*callback).embed_callback, (*callback).embed_userdata) },
+            tokenized: std::sync::Mutex::new(None),
+            embedded: std::sync::Mutex::new(None),
             n_batch: usize::from(unsafe { (*param).extend_param.n_batch }).max(1),
             seen: std::sync::Mutex::new(Vec::new()),
             cleared: std::sync::Mutex::new(None),
@@ -122,6 +140,37 @@ unsafe impl RkllmApi for FakeApi {
         *state.seen.lock().unwrap() = (0..n_batch)
             .map(|i| unsafe { read_input(input.add(i)) })
             .collect();
+
+        // A real runtime tokenizes and embeds the prompt before generating, so
+        // this is where those callbacks would fire.
+        if let (Some(tokenize), userdata) = state.tokenizer {
+            const TEXT: &str = "hello";
+            let mut buffer = [0i32; 8];
+            let written = unsafe {
+                tokenize(
+                    userdata,
+                    TEXT.as_ptr().cast::<c_char>(),
+                    TEXT.len() as i32,
+                    buffer.as_mut_ptr(),
+                    buffer.len() as i32,
+                )
+            };
+            *state.tokenized.lock().unwrap() = Some((written, buffer.to_vec()));
+        }
+        if let (Some(embed), userdata) = state.embed {
+            let mut tokens = [11i32, 22, 33];
+            let mut buffer = [0f32; 6];
+            let code = unsafe {
+                embed(
+                    userdata,
+                    tokens.as_mut_ptr(),
+                    tokens.len() as u64,
+                    buffer.as_mut_ptr().cast::<c_void>(),
+                    size_of_val(&buffer) as u64,
+                )
+            };
+            *state.embedded.lock().unwrap() = Some((code, buffer.to_vec()));
+        }
 
         let Some(callback) = state.callback else {
             return 0;
@@ -746,4 +795,125 @@ async fn the_stream_refuses_a_batched_session() {
         "one stream cannot carry two independent generations"
     );
     assert!(stream.next().await.is_none(), "and then it ends");
+}
+
+/// What one callback returned, and what it wrote.
+type HookCall<T> = Option<(c_int, Vec<T>)>;
+
+/// What the fake recorded from the tokenizer and embedding callbacks.
+fn last_hooks(session: &RkllmSession<FakeApi>) -> (HookCall<i32>, HookCall<f32>) {
+    // SAFETY: the handle is the `FakeState` this fake allocated.
+    let state = unsafe { &*session.handle().cast::<FakeState>() };
+    let tokenized = state.tokenized.lock().unwrap().clone();
+    let embedded = state.embedded.lock().unwrap().clone();
+    (tokenized, embedded)
+}
+
+fn run_once(session: &RkllmSession<FakeApi>) {
+    let mut input = Input::prompt("x").unwrap();
+    session
+        .run_llm(&mut input, &InferParams::new(), |_| Control::Pause)
+        .unwrap();
+}
+
+#[test]
+fn no_callbacks_are_registered_unless_asked_for() {
+    let session = session();
+    run_once(&session);
+
+    let (tokenized, embedded) = last_hooks(&session);
+    assert_eq!(
+        tokenized, None,
+        "a model with its own tokenizer keeps using it"
+    );
+    assert_eq!(embedded, None, "and likewise its own embedding layer");
+}
+
+#[test]
+fn a_supplied_tokenizer_is_registered_and_called() {
+    let param = Param::new("/dev/null").unwrap();
+    let session = SessionBuilder::new(&param)
+        .tokenizer(|text, out| {
+            // One id per byte, which is enough to prove the text arrived.
+            for (slot, byte) in out.iter_mut().zip(text.bytes()) {
+                *slot = i32::from(byte);
+            }
+            Some(text.len())
+        })
+        .with_api(FakeApi)
+        .unwrap();
+
+    run_once(&session);
+
+    let (tokenized, embedded) = last_hooks(&session);
+    let (written, tokens) = tokenized.expect("the tokenizer was called");
+    assert_eq!(written, 5, "\"hello\" is five bytes");
+    assert_eq!(&tokens[..5], &[104, 101, 108, 108, 111]);
+    assert_eq!(embedded, None, "only the tokenizer was supplied");
+}
+
+#[test]
+fn a_supplied_embedding_is_registered_and_called() {
+    let param = Param::new("/dev/null").unwrap();
+    let session = SessionBuilder::new(&param)
+        .embedding(|tokens, out| {
+            assert_eq!(tokens, [11, 22, 33]);
+            // Three tokens of width two, which is what the lengths imply.
+            for (slot, token) in out.chunks_mut(2).zip(tokens) {
+                slot.fill(*token as f32);
+            }
+            true
+        })
+        .with_api(FakeApi)
+        .unwrap();
+
+    run_once(&session);
+
+    let (tokenized, embedded) = last_hooks(&session);
+    assert_eq!(tokenized, None, "only the embedding was supplied");
+    let (code, values) = embedded.expect("the embedding was called");
+    assert_eq!(code, 0);
+    assert_eq!(values, vec![11.0, 11.0, 22.0, 22.0, 33.0, 33.0]);
+}
+
+#[test]
+fn both_callbacks_can_be_supplied_at_once() {
+    let param = Param::new("/dev/null").unwrap();
+    let session = SessionBuilder::new(&param)
+        .tokenizer(|_, out| {
+            out[0] = 1;
+            Some(1)
+        })
+        .embedding(|_, out| {
+            out.fill(0.5);
+            true
+        })
+        .with_api(FakeApi)
+        .unwrap();
+
+    run_once(&session);
+
+    let (tokenized, embedded) = last_hooks(&session);
+    assert_eq!(tokenized.expect("tokenizer ran").0, 1);
+    assert_eq!(embedded.expect("embedding ran").0, 0);
+}
+
+#[test]
+fn the_hooks_survive_the_session_being_moved() {
+    let param = Param::new("/dev/null").unwrap();
+    let session = SessionBuilder::new(&param)
+        .tokenizer(|text, out| {
+            out[0] = text.len() as i32;
+            Some(1)
+        })
+        .with_api(FakeApi)
+        .unwrap();
+
+    // The runtime was told where the hooks live during init. Moving the session
+    // must not invalidate that, which is why they are boxed.
+    let moved = Arc::new(session);
+    run_once(&moved);
+
+    let (tokenized, _) = last_hooks(&moved);
+    assert_eq!(tokenized.expect("the tokenizer still ran").1[0], 5);
 }
