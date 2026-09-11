@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Everything here runs on x86 with no librkllmrt present, which works because
+# the default feature resolves the RKLLM symbols at run time rather than link
+# time. Two things CI cannot cover: the `link` feature past `cargo clippy`,
+# since linking wants the real library, and anything that touches an NPU.
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Format and docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component rustfmt --no-self-update
+          rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # --no-deps keeps this to our own crates, so denying warnings here
+      # cannot be tripped by a dependency.
+      - name: Build documentation
+        run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  clippy:
+    name: Clippy, ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The sys crate alone is useful with no flavour at all: the types and
+          # the trait are there for anyone implementing it themselves.
+          - name: sys crate bare
+            args: -p rkllm-sys --no-default-features
+          - name: default
+            args: --workspace
+          - name: tokio
+            args: --workspace --features rkllm/tokio
+          - name: link
+            args: --workspace --features rkllm/link
+          - name: link and tokio
+            args: --workspace --features rkllm/link,rkllm/tokio
+          - name: all features
+            args: --workspace --all-features
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component clippy --no-self-update
+          rustup default stable
+
+      # Denying on the clippy invocation rather than through RUSTFLAGS keeps
+      # this to our own code. RUSTFLAGS would fail on a dependency's warnings.
+      - name: Clippy
+        run: cargo clippy ${{ matrix.args }} --all-targets -- -D warnings
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      # Not --all-features: that turns on `link`, and a test binary linking
+      # against a librkllmrt this runner does not have fails at the linker.
+      - name: Test
+        run: cargo test --workspace --features rkllm/tokio
+
+  bindings:
+    name: Checked-in bindings match a fresh generation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component rustfmt --no-self-update
+          rustup default stable
+
+      - name: Install libclang and bindgen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev
+          cargo install bindgen-cli --locked
+
+      - name: Regenerate
+        run: |
+          ./crates/rkllm-sys/regen-bindings.sh
+          cargo fmt --all
+
+      # A warning rather than a failure. This regenerates from upstream, which
+      # moves on its own, and an unrelated pull request should not go red
+      # because Rockchip changed the header.
+      - name: Report drift
+        run: |
+          bindings=crates/rkllm-sys/src/bindings
+          if git diff --quiet -- "$bindings"; then
+            echo "Bindings match a fresh generation."
+          else
+            echo "::warning::Checked-in bindings differ from a fresh generation."
+            git diff --stat -- "$bindings"
+            git diff -- "$bindings"
+          fi

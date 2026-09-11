@@ -1,4 +1,4 @@
-//! Drives `RkllmSession` against a stand-in for `librkllmrt`.
+//! Drives [`RkllmSession`] against a stand-in for `librkllmrt`.
 //!
 //! The fake implements `RkllmApi` by storing the trampoline that `rkllm_init`
 //! registers and calling it back from `rkllm_run`, which is exactly what the
@@ -16,7 +16,7 @@ use rkllm_sys::{
     RKLLMResultLastHiddenLayer, RKLLMResultLogits, RkllmApi,
 };
 
-use rkllm::{CallState, Control, InferParams, Input, Param, RkllmSession};
+use crate::{CallState, Control, InferParams, Input, Param, RkllmSession};
 
 /// What the fake hands back, one call to the trampoline per entry.
 const CHUNKS: [&str; 3] = ["Hello", ", ", "world"];
@@ -186,8 +186,8 @@ unsafe impl RkllmApi for FakeApi {
 }
 
 fn session() -> RkllmSession<FakeApi> {
-    let param = Param::new(&FakeApi, "/dev/null").unwrap();
-    RkllmSession::new(FakeApi, &param).unwrap()
+    let param = Param::new("/dev/null").unwrap();
+    RkllmSession::with_api(FakeApi, &param).unwrap()
 }
 
 #[test]
@@ -273,7 +273,7 @@ fn interior_nul_is_rejected_rather_than_truncated() {
     let err = Input::prompt("bad\0prompt").unwrap_err();
     assert!(matches!(
         err,
-        rkllm::Error::InteriorNul {
+        crate::Error::InteriorNul {
             field: "prompt",
             position: 3
         }

@@ -7,6 +7,13 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::ptr;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+#[cfg(feature = "libloading")]
+use std::path::Path;
+
+#[cfg(feature = "libloading")]
+use rkllm_sys::RkllmRuntime;
+#[cfg(feature = "link")]
+use rkllm_sys::RkllmStatic;
 use rkllm_sys::{LLMCallState, LLMHandle, RKLLMCallback, RKLLMLoraAdapter, RKLLMResult, RkllmApi};
 
 use crate::error::{Error, Result};
@@ -17,10 +24,13 @@ use crate::param::Param;
 
 /// A loaded model, and the runtime handle that owns it.
 ///
-/// Created with [`RkllmSession::new`], destroyed on drop. The type parameter is
-/// which set of bindings to dispatch through: `Linked` for symbols the linker
-/// resolved, or an `RkllmRuntime` loaded at run time. Wrap the latter in an
-/// `Arc` to share one loaded library between sessions.
+/// Destroyed on drop. The type parameter is which set of bindings to dispatch
+/// through, and each flavour brings its own constructor:
+///
+/// * [`RkllmSession::<RkllmRuntime>::new_with_library`] opens `librkllmrt.so`
+///   with `dlopen`. Needs the default `libloading` feature.
+/// * [`RkllmSession::<RkllmStatic>::new`] uses the symbols the linker
+///   resolved. Needs the `link` feature.
 ///
 /// # Threads
 ///
@@ -46,10 +56,19 @@ unsafe impl<A: RkllmApi + Send> Send for RkllmSession<A> {}
 unsafe impl<A: RkllmApi + Sync> Sync for RkllmSession<A> {}
 
 impl<A: RkllmApi> RkllmSession<A> {
-    /// Loads a model, and returns the session that owns it.
-    pub fn new(api: A, param: &Param) -> Result<Self> {
+    /// Loads a model through `api`, and returns the session that owns it.
+    ///
+    /// Private on purpose. Callers reach a session through the constructor for
+    /// the flavour they want, so the bindings stay an implementation detail
+    /// rather than something every call site has to name.
+    pub(crate) fn with_api(api: A, param: &Param) -> Result<Self> {
+        // Start from this runtime's own defaults, then lay the caller's
+        // settings over the top.
+        // SAFETY: the call takes no arguments and returns a plain value.
+        let mut raw_param = unsafe { api.rkllm_createDefaultParam() };
+        param.apply_to(&mut raw_param);
+
         let mut handle: LLMHandle = ptr::null_mut();
-        let mut raw_param = param.as_raw();
         let mut callback = RKLLMCallback {
             result_callback: Some(trampoline),
             // Left null on purpose. The per-run `userdata` argument of
@@ -296,6 +315,54 @@ impl<A: RkllmApi> RkllmSession<A> {
             )
         };
         Error::check("rkllm_set_function_tools", code)
+    }
+}
+
+/// Sessions over symbols the linker resolved.
+#[cfg(feature = "link")]
+impl RkllmSession<RkllmStatic> {
+    /// Loads a model, dispatching through the linked `librkllmrt`.
+    ///
+    /// ```no_run
+    /// # use rkllm::{Param, RkllmSession, Result};
+    /// # fn f() -> Result<()> {
+    /// let param = Param::new("/data/qwen.rkllm")?.max_new_tokens(256);
+    /// let session = RkllmSession::new(&param)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new(param: &Param) -> Result<Self> {
+        RkllmSession::with_api(RkllmStatic, param)
+    }
+}
+
+/// Sessions over a runtime opened with `dlopen`.
+#[cfg(feature = "libloading")]
+impl RkllmSession<RkllmRuntime> {
+    /// Opens the RKLLM shared library at `path`, then loads a model through it.
+    ///
+    /// `path` may be a full path or a bare name such as `librkllmrt.so`, which
+    /// the dynamic loader resolves against the usual search path.
+    /// [`rkllm_sys::LIBRARY_NAME`] holds that name.
+    ///
+    /// The library stays open for as long as the session lives. Opening the
+    /// same library for several sessions is cheap, since the loader reference
+    /// counts it rather than mapping it twice.
+    ///
+    /// ```no_run
+    /// # use rkllm::{Param, RkllmSession, Result};
+    /// # fn f() -> Result<()> {
+    /// let param = Param::new("/data/qwen.rkllm")?.max_new_tokens(256);
+    /// let session = RkllmSession::new_with_library(rkllm_sys::LIBRARY_NAME, &param)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new_with_library(path: impl AsRef<Path>, param: &Param) -> Result<Self> {
+        // SAFETY: loading a shared object runs its initializers. The caller
+        // names the library, and is trusting it the same way they trust any
+        // native dependency.
+        let runtime = unsafe { RkllmRuntime::new(path.as_ref()) }?;
+        RkllmSession::with_api(runtime, param)
     }
 }
 
