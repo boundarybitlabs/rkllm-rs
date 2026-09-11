@@ -7,25 +7,63 @@
 //! ```
 //!
 //! The runtime is opened with `dlopen` at startup, so nothing needs to be
-//! linked at build time. Set `RKLLM_LIB` to load it from somewhere other than
-//! the system search path.
-//!
-//! Pass `--chatml` to frame the prompt with the ChatML tags that MiniCPM4 and
-//! the Qwen family expect. Leave it off unless you need it. A converted model
-//! usually carries its own template, and the runtime warns that setting one
-//! here turns the built-in parsing off, thinking mode included.
+//! linked at build time.
 
 use std::io::Write;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use clap::Parser;
 use rkllm::{CallState, Control, InferParams, Input, Param, PerfStat, RkllmSession};
 use rkllm_sys::{LIBRARY_NAME, RkllmRuntime};
 
 const DEFAULT_PROMPT: &str = "Explain who Napoleon Bonaparte is in two or three sentences.";
 
+/// Run one prompt against a .rkllm model on a Rockchip NPU.
+#[derive(Debug, Parser)]
+#[command(version)]
+struct Args {
+    /// Path to the .rkllm model file.
+    model: String,
+
+    /// The prompt. Omit it for a built-in one.
+    prompt: Vec<String>,
+
+    /// Frame the prompt with ChatML tags.
+    ///
+    /// Leave this off unless you need it. A converted model usually carries its
+    /// own template, and the runtime warns that setting one here turns the
+    /// built-in parsing off, thinking mode included.
+    #[arg(long)]
+    chatml: bool,
+
+    /// The RKLLM shared library to open.
+    #[arg(long, env = "RKLLM_LIB", default_value = LIBRARY_NAME)]
+    library: String,
+
+    /// Tokens the context window holds.
+    #[arg(long, default_value_t = 4096)]
+    max_context_len: i32,
+
+    /// Tokens to generate before stopping.
+    #[arg(long, default_value_t = 256)]
+    max_new_tokens: i32,
+
+    /// Sampling temperature.
+    #[arg(long, default_value_t = 0.7)]
+    temperature: f32,
+
+    /// Top-K sampling cutoff.
+    #[arg(long, default_value_t = 40)]
+    top_k: i32,
+
+    /// Top-P, or nucleus, sampling cutoff.
+    #[arg(long, default_value_t = 0.9)]
+    top_p: f32,
+}
+
 fn main() -> ExitCode {
-    match run() {
+    match run(Args::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");
@@ -34,46 +72,31 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let mut chatml = false;
-    let mut positional = Vec::new();
-    for arg in std::env::args().skip(1) {
-        if arg == "--chatml" {
-            chatml = true;
-        } else {
-            positional.push(arg);
-        }
-    }
-
-    let Some((model_path, prompt)) = positional.split_first() else {
-        eprintln!("usage: chat [--chatml] <model.rkllm> [prompt ...]");
-        return Err("no model path given".into());
-    };
-    let prompt = if prompt.is_empty() {
+fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let prompt = if args.prompt.is_empty() {
         DEFAULT_PROMPT.to_owned()
     } else {
-        prompt.join(" ")
+        args.prompt.join(" ")
     };
 
-    let library = std::env::var("RKLLM_LIB").unwrap_or_else(|_| LIBRARY_NAME.to_owned());
-    eprintln!("loading {library}");
+    eprintln!("loading {}", args.library);
     // SAFETY: loading a shared object runs its initializers. This one is the
     // RKLLM runtime, whose symbols the bindings were generated from.
-    let runtime = unsafe { RkllmRuntime::new(&library) }?;
+    let runtime = unsafe { RkllmRuntime::new(&args.library) }?;
 
-    let param = Param::new(&runtime, model_path.as_str())?
-        .max_context_len(4096)
-        .max_new_tokens(256)
-        .temperature(0.7)
-        .top_k(40)
-        .top_p(0.9);
+    let param = Param::new(&runtime, args.model.as_str())?
+        .max_context_len(args.max_context_len)
+        .max_new_tokens(args.max_new_tokens)
+        .temperature(args.temperature)
+        .top_k(args.top_k)
+        .top_p(args.top_p);
 
-    eprintln!("loading {model_path}");
+    eprintln!("loading {}", args.model);
     let started = Instant::now();
     let session = RkllmSession::new(runtime, &param)?;
     eprintln!("loaded in {:.1}s", started.elapsed().as_secs_f32());
 
-    if chatml {
+    if args.chatml {
         session.set_chat_template(
             "",
             "<|im_start|>user\n",
