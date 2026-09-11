@@ -12,20 +12,32 @@ use std::slice;
 use std::sync::Arc;
 
 use rkllm_sys::{
-    LLMCallState, LLMHandle, LLMResultCallback, RKLLMCallback, RKLLMCrossAttnParam,
-    RKLLMInferParam, RKLLMInput, RKLLMInputType, RKLLMLoraAdapter, RKLLMParam, RKLLMPerfStat,
-    RKLLMResult, RKLLMResultLastHiddenLayer, RKLLMResultLogits, RkllmApi,
+    LLMCallState, LLMGetEmbedCallback, LLMHandle, LLMResultCallback, LLMTokenizerCallback,
+    RKLLMCallback, RKLLMCrossAttnParam, RKLLMInferParam, RKLLMInput, RKLLMInputType,
+    RKLLMLoraAdapter, RKLLMParam, RKLLMPerfStat, RKLLMResult, RKLLMResultLastHiddenLayer,
+    RKLLMResultLogits, RkllmApi,
 };
 
-use crate::{CallState, Control, ImageInput, InferParams, Input, Param, RkllmSession};
+use crate::{
+    CallState, Control, ImageInput, InferParams, Input, Param, RkllmSession, SessionBuilder,
+};
 
 /// What the fake hands back, one call to the trampoline per entry.
 const CHUNKS: [&str; 3] = ["Hello", ", ", "world"];
 
 struct FakeState {
     callback: LLMResultCallback,
-    seen: std::sync::Mutex<Option<SeenInput>>,
-    cleared: std::sync::Mutex<Option<(c_int, c_int, c_int)>>,
+    /// The callbacks a model without its own tokenizer or embedding layer
+    /// would need, with the userdata they were registered alongside.
+    tokenizer: (LLMTokenizerCallback, *mut c_void),
+    embed: (LLMGetEmbedCallback, *mut c_void),
+    tokenized: std::sync::Mutex<Option<(c_int, Vec<i32>)>>,
+    embedded: std::sync::Mutex<Option<(c_int, Vec<f32>)>>,
+    /// What `rkllm_init` was told the batch size would be.
+    n_batch: usize,
+    seen: std::sync::Mutex<Vec<SeenInput>>,
+    cleared: std::sync::Mutex<Option<Vec<(c_int, c_int)>>>,
+    cleared_keep: std::sync::Mutex<c_int>,
 }
 
 /// What the fake read back out of the `RKLLMInput` it was handed.
@@ -90,13 +102,24 @@ unsafe impl RkllmApi for FakeApi {
     unsafe fn rkllm_init(
         &self,
         handle: *mut LLMHandle,
-        _param: *mut RKLLMParam,
+        param: *mut RKLLMParam,
         callback: *mut RKLLMCallback,
     ) -> c_int {
         let state = Box::new(FakeState {
             callback: unsafe { (*callback).result_callback },
-            seen: std::sync::Mutex::new(None),
+            tokenizer: unsafe {
+                (
+                    (*callback).tokenizer_callback,
+                    (*callback).tokenizer_userdata,
+                )
+            },
+            embed: unsafe { ((*callback).embed_callback, (*callback).embed_userdata) },
+            tokenized: std::sync::Mutex::new(None),
+            embedded: std::sync::Mutex::new(None),
+            n_batch: usize::from(unsafe { (*param).extend_param.n_batch }).max(1),
+            seen: std::sync::Mutex::new(Vec::new()),
             cleared: std::sync::Mutex::new(None),
+            cleared_keep: std::sync::Mutex::new(0),
         });
         unsafe { *handle = Box::into_raw(state).cast::<c_void>() };
         0
@@ -110,18 +133,85 @@ unsafe impl RkllmApi for FakeApi {
         userdata: *mut c_void,
     ) -> c_int {
         let state = unsafe { &*handle.cast::<FakeState>() };
-        *state.seen.lock().unwrap() = Some(unsafe { read_input(input) });
+        let n_batch = state.n_batch;
+
+        // Read every input the runtime would, which is what catches a caller
+        // that passed fewer than n_batch.
+        *state.seen.lock().unwrap() = (0..n_batch)
+            .map(|i| unsafe { read_input(input.add(i)) })
+            .collect();
+
+        // A real runtime tokenizes and embeds the prompt before generating, so
+        // this is where those callbacks would fire.
+        if let (Some(tokenize), userdata) = state.tokenizer {
+            const TEXT: &str = "hello";
+            let mut buffer = [0i32; 8];
+            let written = unsafe {
+                tokenize(
+                    userdata,
+                    TEXT.as_ptr().cast::<c_char>(),
+                    TEXT.len() as i32,
+                    buffer.as_mut_ptr(),
+                    buffer.len() as i32,
+                )
+            };
+            *state.tokenized.lock().unwrap() = Some((written, buffer.to_vec()));
+        }
+        if let (Some(embed), userdata) = state.embed {
+            let mut tokens = [11i32, 22, 33];
+            let mut buffer = [0f32; 6];
+            let code = unsafe {
+                embed(
+                    userdata,
+                    tokens.as_mut_ptr(),
+                    tokens.len() as u64,
+                    buffer.as_mut_ptr().cast::<c_void>(),
+                    size_of_val(&buffer) as u64,
+                )
+            };
+            *state.embedded.lock().unwrap() = Some((code, buffer.to_vec()));
+        }
+
         let Some(callback) = state.callback else {
             return 0;
         };
 
-        for (index, chunk) in CHUNKS.iter().enumerate() {
-            let text = CString::new(*chunk).unwrap();
-            let mut result = empty_result();
-            result.text = text.as_ptr();
-            result.token_id = index as i32 + 1;
+        // Every entry walks the same chunks, but later entries stop sooner, so
+        // the batches finish at staggered steps and the run ends only when the
+        // last one does.
+        for (step, chunk) in CHUNKS.iter().enumerate() {
+            // Held for the duration of the call, since the results borrow them.
+            let texts: Vec<Option<CString>> = (0..n_batch)
+                .map(|b| (step + b < CHUNKS.len()).then(|| CString::new(*chunk).unwrap()))
+                .collect();
 
-            let code = unsafe { callback(&mut result, userdata, LLMCallState::RKLLM_RUN_NORMAL) };
+            let mut results: Vec<RKLLMResult> = texts
+                .iter()
+                .enumerate()
+                .map(|(b, text)| {
+                    let mut result = empty_result();
+                    match text {
+                        Some(text) => {
+                            result.text = text.as_ptr();
+                            result.token_id = step as i32 + 1;
+                        }
+                        // A negative id is how the runtime says this entry is
+                        // done, and its text is null.
+                        None => {
+                            result.token_id = -(b as i32 + 1);
+                        }
+                    }
+                    result
+                })
+                .collect();
+
+            let code = unsafe {
+                callback(
+                    results.as_mut_ptr(),
+                    userdata,
+                    LLMCallState::RKLLM_RUN_NORMAL,
+                )
+            };
             // 1 means "pause", which is how a caller stops a run early.
             if code == 1 {
                 return 0;
@@ -178,21 +268,23 @@ unsafe impl RkllmApi for FakeApi {
         end: *mut c_int,
     ) -> c_int {
         let state = unsafe { &*handle.cast::<FakeState>() };
-        // Reads one entry from each array, exactly as the runtime does for a
-        // batch size of one. A wrapper that passed a shorter array would be
-        // reading out of bounds here.
-        let range = if start.is_null() || end.is_null() {
-            (keep, -1, -1)
-        } else {
-            (keep, unsafe { *start }, unsafe { *end })
-        };
-        *state.cleared.lock().unwrap() = Some(range);
+        *state.cleared_keep.lock().unwrap() = keep;
+        // Reads one entry per batch from each array, exactly as the runtime
+        // does. A wrapper passing a shorter array would be read out of bounds.
+        *state.cleared.lock().unwrap() = (!start.is_null() && !end.is_null()).then(|| {
+            (0..state.n_batch)
+                .map(|i| unsafe { (*start.add(i), *end.add(i)) })
+                .collect()
+        });
         0
     }
 
-    unsafe fn rkllm_get_kv_cache_size(&self, _h: LLMHandle, sizes: *mut c_int) -> c_int {
-        // Writes one entry, as the runtime does for a batch size of one.
-        unsafe { *sizes = 7 };
+    unsafe fn rkllm_get_kv_cache_size(&self, handle: LLMHandle, sizes: *mut c_int) -> c_int {
+        let state = unsafe { &*handle.cast::<FakeState>() };
+        // Writes one entry per batch, as the runtime does.
+        for i in 0..state.n_batch {
+            unsafe { *sizes.add(i) = 7 + i as c_int };
+        }
         0
     }
 
@@ -279,15 +371,26 @@ unsafe fn read_input(input: *mut RKLLMInput) -> SeenInput {
     seen
 }
 
-/// What the fake recorded about the last run on this session.
-fn last_input(session: &RkllmSession<FakeApi>) -> SeenInput {
+/// Everything the fake read out of the input array on the last run.
+fn last_inputs(session: &RkllmSession<FakeApi>) -> Vec<SeenInput> {
     // SAFETY: the handle is the `FakeState` this fake allocated in rkllm_init.
     let state = unsafe { &*session.handle().cast::<FakeState>() };
-    state.seen.lock().unwrap().clone().expect("a run happened")
+    let seen = state.seen.lock().unwrap().clone();
+    assert!(!seen.is_empty(), "a run happened");
+    seen
+}
+
+/// What the fake read out of the first input on the last run.
+fn last_input(session: &RkllmSession<FakeApi>) -> SeenInput {
+    last_inputs(session).swap_remove(0)
 }
 
 fn session() -> RkllmSession<FakeApi> {
-    let param = Param::new("/dev/null").unwrap();
+    batched_session(1)
+}
+
+fn batched_session(n_batch: u8) -> RkllmSession<FakeApi> {
+    let param = Param::new("/dev/null").unwrap().n_batch(n_batch).unwrap();
     RkllmSession::with_api(FakeApi, &param).unwrap()
 }
 
@@ -366,7 +469,7 @@ fn a_panicking_callback_resumes_on_the_calling_thread() {
 fn strings_reach_the_runtime_intact() {
     let session = session();
     session.set_chat_template("be brief", "", "").unwrap();
-    assert_eq!(session.kv_cache_size().unwrap(), 7);
+    assert_eq!(session.kv_cache_size().unwrap(), vec![7]);
 }
 
 #[test]
@@ -528,16 +631,23 @@ fn tags_default_to_empty_rather_than_null() {
     assert_eq!(seen.tags.0, "", "an unset tag must still be a valid string");
 }
 
-#[test]
-fn clearing_a_range_passes_one_entry_per_array() {
-    let session = session();
-    session.clear_kv_cache_range(4, 9).unwrap();
-
+/// What the fake recorded about the last cache clear.
+fn last_clear(session: &RkllmSession<FakeApi>) -> (c_int, Option<Vec<(c_int, c_int)>>) {
     // SAFETY: the handle is the `FakeState` this fake allocated.
     let state = unsafe { &*session.handle().cast::<FakeState>() };
-    let (keep, start, end) = state.cleared.lock().unwrap().expect("a clear happened");
+    let keep = *state.cleared_keep.lock().unwrap();
+    (keep, state.cleared.lock().unwrap().clone())
+}
 
-    assert_eq!((start, end), (4, 9));
+#[test]
+fn clearing_ranges_passes_one_entry_per_batch() {
+    let session = batched_session(3);
+    session
+        .clear_kv_cache_ranges(&[(1, 2), (3, 4), (5, 6)])
+        .unwrap();
+
+    let (keep, ranges) = last_clear(&session);
+    assert_eq!(ranges, Some(vec![(1, 2), (3, 4), (5, 6)]));
     assert_eq!(keep, 0, "a range overrides the keep-system-prompt flag");
 }
 
@@ -546,10 +656,264 @@ fn clearing_everything_passes_null_ranges() {
     let session = session();
     session.clear_kv_cache(true).unwrap();
 
+    let (keep, ranges) = last_clear(&session);
+    assert_eq!(keep, 1, "the system prompt is kept");
+    assert_eq!(ranges, None, "null arrays mean the whole cache");
+}
+
+#[test]
+fn the_wrong_number_of_ranges_is_rejected() {
+    let session = batched_session(2);
+    let err = session.clear_kv_cache_ranges(&[(1, 2)]).unwrap_err();
+    assert!(matches!(
+        err,
+        crate::Error::BatchSizeMismatch {
+            expected: 2,
+            given: 1
+        }
+    ));
+}
+
+#[test]
+fn the_cache_size_has_one_entry_per_batch() {
+    let session = batched_session(3);
+    assert_eq!(session.kv_cache_size().unwrap(), vec![7, 8, 9]);
+}
+
+#[test]
+fn a_batch_run_passes_every_input() {
+    let session = batched_session(3);
+    let mut inputs = [
+        Input::prompt("first").unwrap(),
+        Input::prompt("second").unwrap(),
+        Input::prompt("third").unwrap(),
+    ];
+
+    session
+        .run_llm_batch(&mut inputs, &InferParams::new(), |_| Control::Continue)
+        .unwrap();
+
+    let prompts: Vec<String> = last_inputs(&session)
+        .into_iter()
+        .map(|i| i.prompt)
+        .collect();
+    assert_eq!(prompts, vec!["first", "second", "third"]);
+}
+
+#[test]
+fn a_batch_run_reports_one_output_per_entry() {
+    let session = batched_session(3);
+    let mut inputs = [
+        Input::prompt("a").unwrap(),
+        Input::prompt("b").unwrap(),
+        Input::prompt("c").unwrap(),
+    ];
+
+    let mut widths = Vec::new();
+    let mut finished_at = vec![None; 3];
+    let mut step = 0usize;
+
+    session
+        .run_llm_batch(&mut inputs, &InferParams::new(), |outputs| {
+            widths.push((outputs[0].state(), outputs.len()));
+            for (entry, output) in outputs.iter().enumerate() {
+                if output.is_finished() && finished_at[entry].is_none() {
+                    finished_at[entry] = Some(step);
+                }
+            }
+            step += 1;
+            Control::Continue
+        })
+        .unwrap();
+
+    // Three generating callbacks of three outputs each, then a final one.
+    assert_eq!(
+        widths,
+        vec![
+            (CallState::Normal, 3),
+            (CallState::Normal, 3),
+            (CallState::Normal, 3),
+            (CallState::Finish, 1),
+        ]
+    );
+    // Later entries stop sooner, so the batches finish at staggered steps.
+    assert_eq!(finished_at, vec![None, Some(2), Some(1)]);
+}
+
+#[test]
+fn a_single_input_call_is_refused_on_a_batched_session() {
+    let session = batched_session(2);
+    let mut input = Input::prompt("only one").unwrap();
+
+    let err = session
+        .run_llm(&mut input, &InferParams::new(), |_| Control::Continue)
+        .unwrap_err();
+
+    assert!(
+        matches!(err, crate::Error::NotSingleBatch { n_batch: 2 }),
+        "passing one input would have the runtime read past its end"
+    );
+}
+
+#[test]
+fn the_wrong_number_of_inputs_is_rejected() {
+    let session = batched_session(3);
+    let mut inputs = [Input::prompt("a").unwrap(), Input::prompt("b").unwrap()];
+
+    let err = session
+        .run_llm_batch(&mut inputs, &InferParams::new(), |_| Control::Continue)
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        crate::Error::BatchSizeMismatch {
+            expected: 3,
+            given: 2
+        }
+    ));
+}
+
+#[test]
+fn a_batch_size_of_zero_is_rejected() {
+    assert!(matches!(
+        Param::new("/dev/null").unwrap().n_batch(0).unwrap_err(),
+        crate::Error::ZeroBatch
+    ));
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn the_stream_refuses_a_batched_session() {
+    use futures_util::StreamExt as _;
+
+    let session = Arc::new(batched_session(2));
+    let mut stream = session.run_llm_async(Input::prompt("hi").unwrap(), InferParams::new());
+
+    let first = stream.next().await.expect("an item");
+    assert!(
+        matches!(first, Err(crate::Error::NotSingleBatch { n_batch: 2 })),
+        "one stream cannot carry two independent generations"
+    );
+    assert!(stream.next().await.is_none(), "and then it ends");
+}
+
+/// What one callback returned, and what it wrote.
+type HookCall<T> = Option<(c_int, Vec<T>)>;
+
+/// What the fake recorded from the tokenizer and embedding callbacks.
+fn last_hooks(session: &RkllmSession<FakeApi>) -> (HookCall<i32>, HookCall<f32>) {
     // SAFETY: the handle is the `FakeState` this fake allocated.
     let state = unsafe { &*session.handle().cast::<FakeState>() };
-    let (keep, start, end) = state.cleared.lock().unwrap().expect("a clear happened");
+    let tokenized = state.tokenized.lock().unwrap().clone();
+    let embedded = state.embedded.lock().unwrap().clone();
+    (tokenized, embedded)
+}
 
-    assert_eq!(keep, 1, "the system prompt is kept");
-    assert_eq!((start, end), (-1, -1), "null arrays mean the whole cache");
+fn run_once(session: &RkllmSession<FakeApi>) {
+    let mut input = Input::prompt("x").unwrap();
+    session
+        .run_llm(&mut input, &InferParams::new(), |_| Control::Pause)
+        .unwrap();
+}
+
+#[test]
+fn no_callbacks_are_registered_unless_asked_for() {
+    let session = session();
+    run_once(&session);
+
+    let (tokenized, embedded) = last_hooks(&session);
+    assert_eq!(
+        tokenized, None,
+        "a model with its own tokenizer keeps using it"
+    );
+    assert_eq!(embedded, None, "and likewise its own embedding layer");
+}
+
+#[test]
+fn a_supplied_tokenizer_is_registered_and_called() {
+    let param = Param::new("/dev/null").unwrap();
+    let session = SessionBuilder::new(&param)
+        .tokenizer(|text, out| {
+            // One id per byte, which is enough to prove the text arrived.
+            for (slot, byte) in out.iter_mut().zip(text.bytes()) {
+                *slot = i32::from(byte);
+            }
+            Some(text.len())
+        })
+        .with_api(FakeApi)
+        .unwrap();
+
+    run_once(&session);
+
+    let (tokenized, embedded) = last_hooks(&session);
+    let (written, tokens) = tokenized.expect("the tokenizer was called");
+    assert_eq!(written, 5, "\"hello\" is five bytes");
+    assert_eq!(&tokens[..5], &[104, 101, 108, 108, 111]);
+    assert_eq!(embedded, None, "only the tokenizer was supplied");
+}
+
+#[test]
+fn a_supplied_embedding_is_registered_and_called() {
+    let param = Param::new("/dev/null").unwrap();
+    let session = SessionBuilder::new(&param)
+        .embedding(|tokens, out| {
+            assert_eq!(tokens, [11, 22, 33]);
+            // Three tokens of width two, which is what the lengths imply.
+            for (slot, token) in out.chunks_mut(2).zip(tokens) {
+                slot.fill(*token as f32);
+            }
+            true
+        })
+        .with_api(FakeApi)
+        .unwrap();
+
+    run_once(&session);
+
+    let (tokenized, embedded) = last_hooks(&session);
+    assert_eq!(tokenized, None, "only the embedding was supplied");
+    let (code, values) = embedded.expect("the embedding was called");
+    assert_eq!(code, 0);
+    assert_eq!(values, vec![11.0, 11.0, 22.0, 22.0, 33.0, 33.0]);
+}
+
+#[test]
+fn both_callbacks_can_be_supplied_at_once() {
+    let param = Param::new("/dev/null").unwrap();
+    let session = SessionBuilder::new(&param)
+        .tokenizer(|_, out| {
+            out[0] = 1;
+            Some(1)
+        })
+        .embedding(|_, out| {
+            out.fill(0.5);
+            true
+        })
+        .with_api(FakeApi)
+        .unwrap();
+
+    run_once(&session);
+
+    let (tokenized, embedded) = last_hooks(&session);
+    assert_eq!(tokenized.expect("tokenizer ran").0, 1);
+    assert_eq!(embedded.expect("embedding ran").0, 0);
+}
+
+#[test]
+fn the_hooks_survive_the_session_being_moved() {
+    let param = Param::new("/dev/null").unwrap();
+    let session = SessionBuilder::new(&param)
+        .tokenizer(|text, out| {
+            out[0] = text.len() as i32;
+            Some(1)
+        })
+        .with_api(FakeApi)
+        .unwrap();
+
+    // The runtime was told where the hooks live during init. Moving the session
+    // must not invalidate that, which is why they are boxed.
+    let moved = Arc::new(session);
+    run_once(&moved);
+
+    let (tokenized, _) = last_hooks(&moved);
+    assert_eq!(tokenized.expect("the tokenizer still ran").1[0], 5);
 }

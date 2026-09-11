@@ -1,0 +1,22 @@
+[package]
+name = "external-hooks-example"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Running .rkllm models exported without their tokenizer or embedding layer"
+
+[[bin]]
+name = "tokenizer-hook"
+path = "src/bin/tokenizer-hook.rs"
+
+[[bin]]
+name = "embedding-hook"
+path = "src/bin/embedding-hook.rs"
+
+[dependencies]
+rkllm = { path = "../../crates/rkllm" }
+clap = { version = "4", features = ["derive"] }
+# The Hugging Face tokenizer, which stands in for the one the model does not
+# carry. Heavy enough that the library crates should not depend on it.
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }

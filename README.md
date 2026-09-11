@@ -25,17 +25,21 @@ hardware.
 Version 0.1.0. The API is unstable.
 
 Wrapped: model loading, text generation with a callback or a `Stream`, prompt,
-token, embedding and image inputs, chat templates, function-calling
-configuration, LoRA adapters, prompt caches, key-value cache control, and
-per-run sampling overrides.
+token, embedding and image inputs, multi-batch inference, chat templates,
+function-calling configuration, LoRA adapters, prompt caches, key-value cache
+control, and per-run sampling overrides.
 
-Not wrapped: video input, cross-attention parameters, multi-batch inference,
-and the tokenizer and embedding callbacks. All of them remain reachable through
-`rkllm-sys`.
+Wrapped since the list above: multi-batch inference. Set `Param::n_batch` and
+run with `RkllmSession::run_llm_batch`, which takes one input per entry and
+reports one output per entry. Streaming stays single-input, since one `Stream`
+cannot carry several independent generations.
 
-Multi-batch changes the shape of both `rkllm_run` and the callback, from one
-input and one result to arrays of them. It is a feature rather than a setting,
-so this crate runs one input at a time and does not expose `n_batch`.
+Also wrapped: the tokenizer and embedding callbacks, for models exported
+without their own. Supply them through `SessionBuilder`, which is what makes
+such a model load at all.
+
+Not wrapped: video input and cross-attention parameters. Both remain reachable
+through `rkllm-sys`.
 
 RKLLM does not encode images. Embeddings come from a separate RKNN vision
 model, which [`examples/qwen2-vl`](examples/qwen2-vl) demonstrates end to end.
@@ -128,8 +132,9 @@ Exercised end to end on this combination:
 | NPU driver | 0.9.8 |
 | Model | MiniCPM4-0.5B, `w8a8_g128`, converted with toolkit 1.2.1 |
 
-Generation ran at roughly 24.5 tokens per second with 633 MB resident. Other
-Rockchip platforms are untested here.
+Generation ran at roughly 24.5 tokens per second with 633 MB resident. A batch
+of four raised that to roughly 39 tokens per second across all four, on the same
+model and about the same memory. Other Rockchip platforms are untested here.
 
 ## Regenerating the bindings
 

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/rkllm-sys", "crates/rkllm"]
 # Needs a second NPU runtime and a git dependency, so it stays out of the
 # default build. Build it from its own directory.
-exclude = ["examples/qwen2-vl"]
+exclude = ["examples/qwen2-vl", "examples/external-hooks"]
 
 [workspace.package]
 edition = "2024"

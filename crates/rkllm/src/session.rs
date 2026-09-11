@@ -5,6 +5,7 @@ use std::ffi::CString;
 use std::os::raw::{c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::ptr;
+use std::slice;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 #[cfg(feature = "libloading")]
@@ -14,9 +15,12 @@ use std::path::Path;
 use rkllm_sys::RkllmRuntime;
 #[cfg(feature = "link")]
 use rkllm_sys::RkllmStatic;
-use rkllm_sys::{LLMCallState, LLMHandle, RKLLMCallback, RKLLMLoraAdapter, RKLLMResult, RkllmApi};
+use rkllm_sys::{
+    LLMCallState, LLMHandle, RKLLMCallback, RKLLMInput, RKLLMLoraAdapter, RKLLMResult, RkllmApi,
+};
 
 use crate::error::{Error, Result};
+use crate::hooks::{Hooks, embedding_trampoline, tokenizer_trampoline};
 use crate::infer::InferParams;
 use crate::input::Input;
 use crate::output::{CallState, Control, Output};
@@ -44,6 +48,10 @@ use crate::param::Param;
 pub struct RkllmSession<A: RkllmApi> {
     api: A,
     handle: LLMHandle,
+    n_batch: usize,
+    /// Boxed so its address survives this struct being moved, since
+    /// `rkllm_init` was already told where to find it.
+    _hooks: Box<Hooks>,
     run_lock: Mutex<()>,
 }
 
@@ -62,11 +70,21 @@ impl<A: RkllmApi> RkllmSession<A> {
     /// the flavour they want, so the bindings stay an implementation detail
     /// rather than something every call site has to name.
     pub(crate) fn with_api(api: A, param: &Param) -> Result<Self> {
+        Self::with_api_and_hooks(api, param, Hooks::default())
+    }
+
+    /// As [`RkllmSession::with_api`], with callbacks the model may require.
+    pub(crate) fn with_api_and_hooks(api: A, param: &Param, hooks: Hooks) -> Result<Self> {
         // Start from this runtime's own defaults, then lay the caller's
         // settings over the top.
         // SAFETY: the call takes no arguments and returns a plain value.
         let mut raw_param = unsafe { api.rkllm_createDefaultParam() };
         param.apply_to(&mut raw_param);
+
+        // Boxed before init, so the address handed to the runtime is the one the
+        // session goes on owning.
+        let hooks = Box::new(hooks);
+        let hooks_ptr = (&raw const *hooks).cast_mut().cast::<c_void>();
 
         let mut handle: LLMHandle = ptr::null_mut();
         let mut callback = RKLLMCallback {
@@ -74,10 +92,26 @@ impl<A: RkllmApi> RkllmSession<A> {
             // Left null on purpose. The per-run `userdata` argument of
             // `rkllm_run` takes precedence, and that is where the closure goes.
             result_userdata: ptr::null_mut(),
-            tokenizer_callback: None,
-            tokenizer_userdata: ptr::null_mut(),
-            embed_callback: None,
-            embed_userdata: ptr::null_mut(),
+            // Registered only when supplied, so a model with its own tokenizer
+            // or embedding layer goes on using it.
+            tokenizer_callback: hooks
+                .tokenizer
+                .is_some()
+                .then_some(tokenizer_trampoline as unsafe extern "C" fn(_, _, _, _, _) -> _),
+            tokenizer_userdata: if hooks.tokenizer.is_some() {
+                hooks_ptr
+            } else {
+                ptr::null_mut()
+            },
+            embed_callback: hooks
+                .embedding
+                .is_some()
+                .then_some(embedding_trampoline as unsafe extern "C" fn(_, _, _, _, _) -> _),
+            embed_userdata: if hooks.embedding.is_some() {
+                hooks_ptr
+            } else {
+                ptr::null_mut()
+            },
         };
 
         // SAFETY: all three pointers are to live, initialized values, and the
@@ -88,11 +122,25 @@ impl<A: RkllmApi> RkllmSession<A> {
             return Err(Error::NullHandle);
         }
 
+        // Read back rather than from the `Param`, so an unset batch size picks
+        // up whatever default this build of the runtime uses. Every later call
+        // is sized against this, so it must match what the runtime will read.
+        let n_batch = usize::from(raw_param.extend_param.n_batch).max(1);
+
         Ok(RkllmSession {
             api,
             handle,
+            n_batch,
+            _hooks: hooks,
             run_lock: Mutex::new(()),
         })
+    }
+
+    /// How many inputs this session runs per forward pass.
+    ///
+    /// Every run and cache call works in terms of this many entries.
+    pub fn n_batch(&self) -> usize {
+        self.n_batch
     }
 
     /// The bindings this session dispatches through.
@@ -117,7 +165,7 @@ impl<A: RkllmApi> RkllmSession<A> {
         self.run_lock.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Runs inference, calling `callback` for every chunk the runtime produces.
+    /// Runs one input, calling `callback` for every chunk the runtime produces.
     ///
     /// This blocks until the run finishes, fails, or the callback returns
     /// [`Control::Pause`]. The callback fires on this thread.
@@ -127,6 +175,9 @@ impl<A: RkllmApi> RkllmSession<A> {
     ///
     /// A panic inside the callback is caught, the run is stopped, and the panic
     /// resumes on this thread once the runtime has returned.
+    ///
+    /// Fails with [`Error::NotSingleBatch`] on a session built for a larger
+    /// batch, where [`RkllmSession::run_llm_batch`] is the call to use.
     ///
     /// ```no_run
     /// # use rkllm::{Control, InferParams, Input, RkllmSession, Result};
@@ -144,24 +195,113 @@ impl<A: RkllmApi> RkllmSession<A> {
     where
         F: FnMut(Output<'_>) -> Control,
     {
-        let _guard = self.lock_run();
+        if self.n_batch != 1 {
+            return Err(Error::NotSingleBatch {
+                n_batch: self.n_batch,
+            });
+        }
 
         let mut callback = callback;
-        let mut state = CallbackState {
-            callback: &mut callback,
-            panic: None,
+        // Present the one-entry slice as a single output, so the common case
+        // does not have to index.
+        let mut adapter = |outputs: &[Output<'_>]| match outputs.first() {
+            Some(output) => callback(*output),
+            None => Control::Continue,
         };
-        let mut raw_input = input.as_raw();
+        self.run_batch(std::slice::from_mut(input), params, &mut adapter)
+    }
+
+    /// Runs `inputs` side by side, one generation per entry.
+    ///
+    /// The slice must hold exactly [`RkllmSession::n_batch`] inputs, since that
+    /// is how many the runtime reads. The callback receives one [`Output`] per
+    /// entry, in the same order, and returns a single [`Control`] governing the
+    /// whole run, because the C API takes one decision for all of them.
+    ///
+    /// A batch entry that has stopped generating reports
+    /// [`Output::is_finished`]. The run ends once every entry has.
+    ///
+    /// # The slice is shorter in the final states
+    ///
+    /// Under [`CallState::Finish`] and [`CallState::Error`] the callback gets a
+    /// single output rather than one per entry. Those states carry run-wide
+    /// information, the perf statistics among it, and the SDK's own example
+    /// indexes the result array only while generating. Reading further would
+    /// mean trusting that the array is still `n_batch` long, which nothing
+    /// documents.
+    ///
+    /// ```no_run
+    /// # use rkllm::{Control, InferParams, Input, RkllmSession, Result};
+    /// # use rkllm_sys::RkllmApi;
+    /// # fn f<A: RkllmApi>(session: &RkllmSession<A>) -> Result<()> {
+    /// let mut inputs = [
+    ///     Input::prompt("Name a colour.")?,
+    ///     Input::prompt("Name a fruit.")?,
+    /// ];
+    /// session.run_llm_batch(&mut inputs, &InferParams::new(), |outputs| {
+    ///     for (entry, output) in outputs.iter().enumerate() {
+    ///         if let Some(text) = output.text() {
+    ///             print!("[{entry}] {text}");
+    ///         }
+    ///     }
+    ///     Control::Continue
+    /// })?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn run_llm_batch<F>(
+        &self,
+        inputs: &mut [Input],
+        params: &InferParams,
+        callback: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[Output<'_>]) -> Control,
+    {
+        let mut callback = callback;
+        self.run_batch(inputs, params, &mut callback)
+    }
+
+    /// The one path into `rkllm_run`, shared by both public run methods.
+    fn run_batch(
+        &self,
+        inputs: &mut [Input],
+        params: &InferParams,
+        callback: &mut dyn FnMut(&[Output<'_>]) -> Control,
+    ) -> Result<()> {
+        if inputs.len() != self.n_batch {
+            return Err(Error::BatchSizeMismatch {
+                expected: self.n_batch,
+                given: inputs.len(),
+            });
+        }
+
+        let _guard = self.lock_run();
+
+        // The runtime reads `n_batch` contiguous inputs, so they have to be laid
+        // out as one array rather than handed over one at a time.
+        let mut raw_inputs: Vec<RKLLMInput> = inputs.iter_mut().map(Input::as_raw).collect();
         let mut scratch = params.scratch();
         let mut raw_params = scratch.as_raw();
+
+        let mut state = CallbackState {
+            callback,
+            n_batch: self.n_batch,
+            panic: None,
+        };
         let userdata = (&raw mut state).cast::<c_void>();
 
-        // SAFETY: the handle is live, both raw structs point at storage owned
-        // by `input`, `scratch` and `params`, all of which outlive the call,
-        // and `userdata` is the `CallbackState` the trampoline expects.
+        // SAFETY: the handle is live; `raw_inputs` holds exactly the `n_batch`
+        // entries the runtime reads and points at storage owned by `inputs`,
+        // which outlives the call; and `userdata` is the `CallbackState` the
+        // trampoline expects.
         let code = unsafe {
-            self.api
-                .rkllm_run(self.handle, &mut raw_input, &mut raw_params, userdata)
+            self.api.rkllm_run(
+                self.handle,
+                raw_inputs.as_mut_ptr(),
+                &mut raw_params,
+                userdata,
+            )
         };
 
         if let Some(panic) = state.panic {
@@ -237,25 +377,34 @@ impl<A: RkllmApi> RkllmSession<A> {
         Error::check("rkllm_clear_kv_cache", code)
     }
 
-    /// Clears one half-open range of the key-value cache.
+    /// Clears one half-open range of the key-value cache per batch entry.
+    ///
+    /// The slice must hold exactly [`RkllmSession::n_batch`] ranges, since that
+    /// is how many the runtime reads.
     ///
     /// # The runtime ignores this unless the run is paused
     ///
     /// A range only takes effect when the run was configured with
-    /// [`InferParams::keep_history`] set to `false`
-    /// and is currently suspended, which means the callback returned
-    /// [`Control::Pause`]. Outside that, the call
-    /// succeeds and changes nothing.
+    /// [`InferParams::keep_history`] set to `false` and is currently suspended,
+    /// which means the callback returned [`Control::Pause`]. Outside that, the
+    /// call succeeds and changes nothing.
     ///
     /// Use [`RkllmSession::clear_kv_cache`] to clear the whole cache instead.
-    pub fn clear_kv_cache_range(&self, start: c_int, end: c_int) -> Result<()> {
+    pub fn clear_kv_cache_ranges(&self, ranges: &[(c_int, c_int)]) -> Result<()> {
+        if ranges.len() != self.n_batch {
+            return Err(Error::BatchSizeMismatch {
+                expected: self.n_batch,
+                given: ranges.len(),
+            });
+        }
+
+        // Split into the two parallel arrays the C API wants.
+        let mut start: Vec<c_int> = ranges.iter().map(|(s, _)| *s).collect();
+        let mut end: Vec<c_int> = ranges.iter().map(|(_, e)| *e).collect();
+
         let _guard = self.lock_run();
-        // One entry each, because this crate runs one input at a time. See the
-        // note on `Param` about why batching is not exposed.
-        let mut start = [start];
-        let mut end = [end];
-        // SAFETY: the handle is live, and both arrays hold the one entry the
-        // runtime reads for a batch size of one.
+        // SAFETY: the handle is live, and both arrays hold the `n_batch`
+        // entries the runtime reads.
         let code = unsafe {
             self.api
                 .rkllm_clear_kv_cache(self.handle, 0, start.as_mut_ptr(), end.as_mut_ptr())
@@ -263,20 +412,22 @@ impl<A: RkllmApi> RkllmSession<A> {
         Error::check("rkllm_clear_kv_cache", code)
     }
 
-    /// Reads how many positions the key-value cache currently holds.
-    pub fn kv_cache_size(&self) -> Result<c_int> {
+    /// Reads how many positions the key-value cache holds, per batch entry.
+    ///
+    /// The returned vector has [`RkllmSession::n_batch`] entries.
+    pub fn kv_cache_size(&self) -> Result<Vec<c_int>> {
         // Sized here rather than by the caller: a length shorter than the
         // runtime's batch size would have it write out of bounds.
-        let mut sizes = [0 as c_int];
+        let mut sizes = vec![0 as c_int; self.n_batch];
         let _guard = self.lock_run();
-        // SAFETY: the handle is live, and the array holds the one entry the
-        // runtime writes for a batch size of one.
+        // SAFETY: the handle is live, and the array holds the `n_batch` entries
+        // the runtime writes.
         let code = unsafe {
             self.api
                 .rkllm_get_kv_cache_size(self.handle, sizes.as_mut_ptr())
         };
         Error::check("rkllm_get_kv_cache_size", code)?;
-        Ok(sizes[0])
+        Ok(sizes)
     }
 
     /// Sets the chat template framing each turn.
@@ -394,8 +545,10 @@ impl<A: RkllmApi> std::fmt::Debug for RkllmSession<A> {
 }
 
 /// What the trampoline finds behind the `userdata` pointer.
-struct CallbackState<'a> {
-    callback: &'a mut dyn FnMut(Output<'_>) -> Control,
+struct CallbackState<'a, 'cb> {
+    callback: &'a mut (dyn FnMut(&[Output<'_>]) -> Control + 'cb),
+    /// How many results the runtime writes while generating.
+    n_batch: usize,
     panic: Option<Box<dyn Any + Send>>,
 }
 
@@ -410,20 +563,46 @@ unsafe extern "C" fn trampoline(
         return Control::Pause.as_code();
     }
 
-    // SAFETY: `run_llm` is the only caller that reaches here, and it always
+    // SAFETY: `run_batch` is the only caller that reaches here, and it always
     // passes a live `CallbackState` that outlives the run.
-    let CallbackState { callback, panic } = unsafe { &mut *userdata.cast::<CallbackState<'_>>() };
+    let CallbackState {
+        callback,
+        n_batch,
+        panic,
+    } = unsafe { &mut *userdata.cast::<CallbackState<'_, '_>>() };
 
     // A previous callback already panicked, so stop rather than run more code.
     if panic.is_some() {
         return Control::Pause.as_code();
     }
 
-    // SAFETY: the runtime passes either null or a valid result that lives for
-    // the duration of this call, which bounds the `Output` the closure sees.
-    let output = Output::new(CallState::from(state), unsafe { result.as_ref() });
+    let call_state = CallState::from(state);
 
-    match catch_unwind(AssertUnwindSafe(|| callback(output))) {
+    // While generating, the runtime writes one result per batch entry. In the
+    // final states it reports the run as a whole, and the SDK's example does
+    // not index the array there, so neither do we.
+    let len = if call_state.is_final() { 1 } else { *n_batch };
+
+    let outputs: Vec<Output<'_>> = if result.is_null() {
+        Vec::new()
+    } else {
+        // SAFETY: the runtime passes an array of `n_batch` results that lives
+        // for the duration of this call, which bounds the `Output`s handed to
+        // the closure. `len` never exceeds what it wrote.
+        unsafe { slice::from_raw_parts(result, len) }
+            .iter()
+            .map(|entry| Output::new(call_state, Some(entry)))
+            .collect()
+    };
+    // A null result still has to reach the closure, so it sees the state.
+    let fallback = [Output::new(call_state, None)];
+    let outputs: &[Output<'_>] = if outputs.is_empty() {
+        &fallback
+    } else {
+        &outputs
+    };
+
+    match catch_unwind(AssertUnwindSafe(|| callback(outputs))) {
         Ok(control) => control.as_code(),
         Err(unwound) => {
             *panic = Some(unwound);
